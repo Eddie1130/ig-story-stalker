@@ -1,6 +1,7 @@
 
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
+import { closeBrowserOnShutdown } from './login-shutdown.mjs';
 
 const PROFILE_DIR = '/data/profile';
 const LOG_FILE = '/app/logs/audit.log';
@@ -65,7 +66,12 @@ try {
     message: 'Open noVNC and log in manually. Do not open Stories.'
   });
 
-  await new Promise(() => {});
+  const shutdownReason = await closeBrowserOnShutdown(context);
+  context = undefined;
+
+  log('LOGIN_BROWSER_STOPPED', {
+    reason: shutdownReason,
+  });
 } catch (err) {
   log('LOGIN_FATAL', { message: err?.message, stack: err?.stack });
   process.exitCode = 1;

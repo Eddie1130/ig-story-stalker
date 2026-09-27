@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "check": "node --check src/*.mjs",
-    "test": "npm run check"
+    "test": "npm run check && node --test"
   },
   "engines": {
     "node": ">=22"

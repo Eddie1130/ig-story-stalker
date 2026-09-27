@@ -66,7 +66,9 @@ Open the following page and enter the VNC password from `.env`:
 http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
 ```
 
-Log in to Instagram, then stop the container with `Ctrl-C`. The session is retained in `data/profile/`.
+Log in to Instagram, then stop the container with `Ctrl-C`. Wait for
+`LOGIN_BROWSER_STOPPED` before running another browser command. Chromium closes
+cleanly and the session is retained in `data/profile/`.
 
 For a remote host, prefer an SSH tunnel instead of exposing noVNC:
 
