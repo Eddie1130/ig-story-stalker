@@ -1,0 +1,34 @@
+name: ig-story-stalker
+
+services:
+  ig-check:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ig-story-check
+    shm_size: "512mb"
+    environment:
+      TZ: Asia/Hong_Kong
+      IG_TARGET_USERNAME: ${IG_TARGET_USERNAME}
+      IG_TARGET_USER_ID: ${IG_TARGET_USER_ID}
+    volumes:
+      - ${IG_DATA_DIR:-./data}/profile:/data/profile
+      - ${IG_LOG_DIR:-./logs}:/app/logs
+    restart: "no"
+
+  ig-login:
+    profiles: ["login"]
+    build:
+      context: .
+      dockerfile: Dockerfile.login
+    container_name: ig-story-login
+    shm_size: "768mb"
+    environment:
+      TZ: Asia/Hong_Kong
+      VNC_PASSWORD: ${VNC_PASSWORD}
+    volumes:
+      - ${IG_DATA_DIR:-./data}/profile:/data/profile
+      - ${IG_LOG_DIR:-./logs}:/app/logs
+    ports:
+      - "${NOVNC_BIND_ADDRESS:-127.0.0.1}:${NOVNC_PORT:-6080}:6080"
+    restart: "no"

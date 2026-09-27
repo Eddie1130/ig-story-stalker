@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+data
+logs
+node_modules
+npm-debug.log*
+coverage
+.codebase-memory
+.DS_Store
+README*

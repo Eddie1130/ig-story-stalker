@@ -1,0 +1,17 @@
+{
+  "name": "ig-story-stalker",
+  "version": "0.1.0",
+  "description": "Self-hosted Instagram Story watcher with Telegram delivery and read-receipt guards",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/*.mjs",
+    "test": "npm run check"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright-core": "1.55.0"
+  }
+}

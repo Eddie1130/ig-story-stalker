@@ -1,0 +1,33 @@
+services:
+  ig-watch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command: ["node", "/app/src/watch-media.mjs"]
+    shm_size: "512mb"
+    env_file:
+      - .env.telegram
+    environment:
+      TZ: Asia/Hong_Kong
+      IG_TARGET_USERNAME: ${IG_TARGET_USERNAME}
+      IG_TARGET_USER_ID: ${IG_TARGET_USER_ID}
+      IG_CHECK_INTERVAL_SECONDS: ${IG_CHECK_INTERVAL_SECONDS:-300}
+    volumes:
+      - ${IG_DATA_DIR:-./data}/profile:/data/profile
+      - ${IG_LOG_DIR:-./logs}:/app/logs
+      - ./src:/app/src:ro
+      - ${IG_DATA_DIR:-./data}/watch:/app/state
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "const fs=require('fs');const s=JSON.parse(fs.readFileSync('/app/state/health.json'));process.exit(Date.now()-s.at<480000&&s.failures<3&&s.telegramOk?0:1)"]
+      interval: 60s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

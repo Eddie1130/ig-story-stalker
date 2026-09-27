@@ -1,0 +1,40 @@
+services:
+  ig-watch:
+    command: ["node", "/app/src/watch-supervisor.mjs"]
+    volumes:
+      - ${IG_DATA_DIR:-./data}/watchdog:/app/watchdog-state:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=JSON.parse(require('fs').readFileSync('/app/state/monitor/health.json'));process.exit(Date.now()-h.at<120000&&h.workerDeadline>Date.now()&&h.phase!=='stopped'&&h.phase!=='fatal'&&(h.activeIssues||0)===0?0:1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 2
+  ig-watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    init: true
+    command: ["node", "/app/src/watchdog.mjs"]
+    env_file:
+      - .env.telegram
+    environment:
+      TZ: Asia/Hong_Kong
+      IG_TARGET_USERNAME: ${IG_TARGET_USERNAME}
+      IG_TARGET_USER_ID: ${IG_TARGET_USER_ID}
+    volumes:
+      - ./src:/app/src:ro
+      - ${IG_DATA_DIR:-./data}/watch:/app/state
+      - ${IG_DATA_DIR:-./data}/watchdog:/app/watchdog-state
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=JSON.parse(require('fs').readFileSync('/app/watchdog-state/health.json'));process.exit(Date.now()-h.at<180000&&h.telegramOk&&(h.activeIssues||0)===0?0:1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

@@ -1,0 +1,19 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.telegram.example
+
+# Browser credentials and runtime state
+data/
+logs/
+
+# Node.js
+node_modules/
+npm-debug.log*
+coverage/
+
+# Local tooling and OS files
+.codebase-memory/
+.DS_Store
+*.tmp
