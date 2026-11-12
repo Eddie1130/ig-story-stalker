@@ -1,4 +1,10 @@
 import { formatJST } from './time-jst.mjs';
+export function mediaFailureReason(error) {
+  const message = error?.message || '';
+  // Keep only machine-readable fetch errors; never include paths or signed URLs.
+  return /^(?:FETCH_[A-Z0-9_]+|STORY_[A-Z0-9_]+|UNTRUSTED_[A-Z0-9_]+|SESSION_INVALID|BOOTSTRAP_[A-Z0-9_]+|CONFIG_ERROR|CRITICAL_[A-Z0-9_]+)(?::http=\d{3})?(?::code=\d+)?(?::exit=(?:-?\d+|null))?$/.test(message)
+    ? message : 'MEDIA_RESULT_READ_FAILED';
+}
 export function validMediaUrl(value) {
   try {
     const u = new URL(value);

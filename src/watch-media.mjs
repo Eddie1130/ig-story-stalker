@@ -1,8 +1,10 @@
+import { CatalogWatcher } from './catalog-watch.mjs';
+import { StoryArchive } from './story-archive.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { save, fetchStories } from './watch-story.mjs';
-import { mediaRequest, validMediaUrl, enqueue, deliver } from './story-media.mjs';
+import { mediaRequest, validMediaUrl, enqueue, deliver, mediaFailureReason } from './story-media.mjs';
 
 const log = (event, data = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
 async function main() {
@@ -74,14 +76,24 @@ async function main() {
     await sendText(`IG Story 媒體通知設定成功\n@${username}\n每 ${interval} 秒檢查；圖片／影片將直接傳送。`);
     log('TELEGRAM_TEST_OK'); return;
   }
-  let nextFetchAt = 0, telegramOk = true;
+  const archive = process.env.IG_ARCHIVE_DIR ? new StoryArchive({
+    root: process.env.IG_ARCHIVE_DIR, stateDir: dir, target, log,
+  }) : null;
+  // Include old Telegram retries, but keep archive history independent of sent IDs.
+  if (archive) archive.enqueue(Object.values(state.pending));
+  const catalog = process.env.IG_CATALOG_ENABLED === '1' ? new CatalogWatcher({
+    root: process.env.IG_ARCHIVE_DIR || '', stateDir: dir, target, username, log,
+    postsInterval: Number(process.env.IG_POSTS_INTERVAL_SECONDS || 900),
+    highlightsInterval: Number(process.env.IG_HIGHLIGHTS_INTERVAL_SECONDS || 900),
+  }) : null;
+  let nextFetchAt = 0, telegramOk = true, archiveOk = true, catalogOk = true;
   const health = () => save(path.join(dir, 'health.json'), {
-    at: Date.now(), failures: state.failures, telegramOk, nextFetchAt,
+    at: Date.now(), failures: state.failures, telegramOk, archiveOk, catalogOk, nextFetchAt,
   });
   heartbeat = setInterval(() => {
     try { health(); } catch { log('WATCH_FATAL', { reason: 'HEALTH_WRITE_FAILED' }); process.exit(1); }
   }, 30000);
-  log('WATCH_MEDIA_STARTED', { target, intervalSeconds: interval, transport: 'telegram_url' });
+  log('WATCH_MEDIA_STARTED', { target, intervalSeconds: interval, transport: 'telegram_url', archiveEnabled: !!archive, catalogEnabled: !!catalog });
   try {
     while (!stopping) {
       if (Date.now() >= nextFetchAt) {
@@ -89,6 +101,7 @@ async function main() {
         const resultFile = path.join(temp, 'result.json');
         const previous = process.env.IG_STORY_RESULT_FILE;
         process.env.IG_STORY_RESULT_FILE = resultFile;
+        let archiveStories = null;
         try {
           const summary = await fetchStories('/app/src/fetch-story.mjs', c => { child = c; });
           if (stopping) break;
@@ -108,6 +121,7 @@ async function main() {
           if (new Set(accounted).size !== accounted.length || accounted.length !== ids.size ||
               accounted.some(id => !ids.has(id) || !/^\d+(?:_\d+)?$/.test(id))) throw Error('UNTRUSTED_MEDIA_COVERAGE');
           enqueue(state, media);
+          archiveStories = media.stories;
           state.failures = 0;
           state.lastSuccess = new Date().toISOString();
           log('WATCH_MEDIA_CHECK_OK', { storyCount: summary.storyCount, mediaCount: media.storyCount,
@@ -115,16 +129,20 @@ async function main() {
         } catch (error) {
           if (stopping) break;
           state.failures++;
-          state.lastError = /^(FETCH_|STORY_|UNTRUSTED_)/.test(error.message) ? error.message : 'MEDIA_RESULT_READ_FAILED';
+          state.lastError = mediaFailureReason(error);
           log('WATCH_CHECK_FAILED', { consecutiveFailures: state.failures, reason: state.lastError });
         } finally {
           if (previous === undefined) delete process.env.IG_STORY_RESULT_FILE;
           else process.env.IG_STORY_RESULT_FILE = previous;
           fs.rmSync(temp, { recursive: true, force: true });
         }
+        // Persist outside the fetch catch: archive history errors must be fatal and visible.
+        if (archive && archiveStories) archive.enqueue(archiveStories);
         nextFetchAt = Date.now() + Math.min(interval * 2 ** Math.min(state.failures, 5), Math.max(interval, 1800)) * 1000;
         persist();
       }
+      // Bounded download phase; Telegram still runs when archive downloads fail.
+      if (archive && !stopping) archiveOk = await archive.run(aborter.signal);
       try {
         telegramOk = true;
         if (state.failures >= 3 && !state.alerted) {
@@ -159,9 +177,14 @@ async function main() {
           log('STORY_MEDIA_RETIRED', { id });
         }
       }
+      if (catalog && !stopping) {
+        await catalog.check(aborter.signal, c => { child = c; });
+        if (!stopping) catalogOk = await catalog.deliver(aborter.signal,
+          (method, body) => callTelegram(method, { ...body, chat_id: chatId }));
+      }
       persist(); health();
       if (process.argv.includes('--once')) {
-        process.exitCode = state.failures > 0 || !telegramOk ? 1 : 0;
+        process.exitCode = state.failures > 0 || !telegramOk || !archiveOk || !catalogOk ? 1 : 0;
         break;
       }
       const delay = Math.max(1000, Math.min(interval * 1000, nextFetchAt - Date.now()));

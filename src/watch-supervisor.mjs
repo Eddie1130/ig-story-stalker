@@ -79,7 +79,20 @@ async function main() {
         const problem = eventIssue(row); if (problem) issues.fail(...problem);
         const now = Date.now();
         health.lastEvent = row.event;
-        if (row.event === 'WATCH_MEDIA_STARTED') {
+        if (row.event.startsWith('CATALOG_')) {
+          health.workerDeadline = now + 150000;
+          if (row.event === 'CATALOG_CHECK_OK') issues.resolve(`catalog-fetch:${safe(row.scope || row.group)}`);
+          if (row.event === 'CATALOG_STORAGE_OK') issues.resolve('catalog-storage');
+          if (row.event === 'CATALOG_MEDIA_SAVED') issues.resolve(`catalog-archive:${safe(row.key)}`);
+          if (row.event === 'CATALOG_TELEGRAM_SENT') issues.resolve(`catalog-telegram:${safe(row.key)}`);
+          if (row.event === 'CATALOG_CAPTION_SAVED') issues.resolve(`catalog-caption:${safe(row.id)}`);
+        } else if (row.event === 'NAS_STORAGE_OK') {
+          issues.resolve('nas-storage'); health.workerDeadline = now + 150000;
+        } else if (row.event === 'STORY_ARCHIVE_SAVED') {
+          issues.resolve(`archive:${safe(row.id)}`); health.workerDeadline = now + 150000;
+        } else if (['STORY_ARCHIVE_STARTED', 'STORY_ARCHIVE_RETRY', 'STORY_ARCHIVE_RETIRED', 'NAS_STORAGE_ERROR', 'WATCH_ARCHIVE_STATUS'].includes(row.event)) {
+          health.workerDeadline = now + 150000;
+        } else if (row.event === 'WATCH_MEDIA_STARTED') {
           health.phase = 'fetching'; health.workerDeadline = now + 150000;
         } else if (row.event === 'WATCH_MEDIA_CHECK_OK') {
           health.phase = 'delivering';

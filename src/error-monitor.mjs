@@ -56,6 +56,14 @@ export function staleReason(health, now = Date.now()) {
 }
 export function eventIssue(row) {
   const event = row?.event;
+  if (event === 'CATALOG_CHECK_FAILED') return [`catalog-fetch:${safe(row.scope || row.group)}`, row.reason || 'CATALOG_FETCH_FAILED'];
+  if (event === 'CATALOG_STORAGE_ERROR') return ['catalog-storage', row.reason || 'CATALOG_STORAGE_FAILED'];
+  if (event === 'CATALOG_ARCHIVE_RETRY') return [`catalog-archive:${safe(row.key)}`, row.reason || 'CATALOG_ARCHIVE_FAILED'];
+  if (event === 'CATALOG_TELEGRAM_RETRY') return [`catalog-telegram:${safe(row.key)}`, row.reason || 'CATALOG_TELEGRAM_FAILED'];
+  if (event === 'CATALOG_CAPTION_RETRY') return [`catalog-caption:${safe(row.id)}`, row.reason || 'CATALOG_CAPTION_FAILED'];
+  if (event === 'NAS_STORAGE_ERROR') return ['nas-storage', row.reason || 'NAS_STORAGE_FAILED'];
+  if (event === 'STORY_ARCHIVE_RETRY') return [`archive:${safe(row.id)}`, row.reason || 'NAS_DOWNLOAD_FAILED'];
+  if (event === 'STORY_ARCHIVE_RETIRED') return [`archive:${safe(row.id)}`, 'NAS_ABANDONED_AFTER_7_DAYS'];
   if (event === 'WATCH_CHECK_FAILED') return ['fetch', row.reason || 'FETCH_FAILED'];
   if (event === 'WATCH_FATAL') return ['worker-fatal', row.reason || 'WORKER_FATAL'];
   if (event === 'STORY_MEDIA_RETRY') return [`media:${safe(row.id)}`, row.reason || 'MEDIA_SEND_FAILED'];

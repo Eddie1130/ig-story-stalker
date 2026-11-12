@@ -10,3 +10,6 @@ coverage
 .codebase-memory
 .DS_Store
 README*
+
+# Downloaded Instagram media
+downloads/

@@ -1,6 +1,6 @@
 # IG Story Stalker
 
-A self-hosted Instagram Story watcher that reuses a manually authenticated Chromium profile, checks one account for new Stories, and delivers available photos and videos to Telegram.
+A self-hosted Instagram Story watcher that reuses a manually authenticated Chromium profile, checks one account for new Stories, delivers available photos and videos to Telegram, and archives Stories, posts, and Highlights to disk.
 
 The project is designed for unattended Docker deployments. It includes a fail-closed network guard, persistent delivery state, health checks, a supervising worker, and an independent watchdog.
 
@@ -19,6 +19,73 @@ The project is designed for unattended Docker deployments. It includes a fail-cl
 - A network guard that blocks Story seen/read mutations and unexpected Instagram write requests
 - Supervisor and watchdog health monitoring with queued Telegram alerts
 - JSON audit logs that avoid recording signed media URLs
+
+## Media downloads
+
+The watcher archives Stories and scans profile posts and Highlights by default.
+Docker mounts `IG_DOWNLOAD_DIR` (default: `./downloads`) at `/downloads` inside
+`ig-watch`. No Synology-specific paths or additional Compose overlays are needed.
+An existing `.env` also uses these defaults without adding new variables.
+
+```text
+downloads/
+  stories/20261016_013000_JST_123456.mp4
+  posts/00001_20261016_013000_JST/
+    01.jpg
+    02.mp4
+    caption.txt
+  highlight/01_旅行/
+    001_20261016_013000_JST.jpg
+```
+
+Filenames use publication time in JST, with detection time as the Story fallback.
+Images retain their actual `.jpg`, `.png`, or `.webp` format. Post carousels retain
+all available photos and videos. Numbering is assigned on first discovery and
+persists across restarts; existing folders retain their original Highlight title.
+Caption edits update `caption.txt` without resending media. Deleted Instagram
+content stays on disk, and downloaded files have no automatic expiry.
+
+The first post/Highlight scan downloads accessible history without Telegram media
+notifications. Later discoveries are downloaded and sent individually to Telegram.
+Story archiving is independent of Telegram delivery, so currently available Stories
+can be archived even if already sent. Expired or deleted Stories cannot be recovered
+unless their media remains accessible. The dedicated Reels tab is not scanned.
+
+Stories use `IG_CHECK_INTERVAL_SECONDS` (default 300). Post scans and Highlight
+scans use `IG_POSTS_INTERVAL_SECONDS` and `IG_HIGHLIGHTS_INTERVAL_SECONDS` (default
+900, range 300–86400). Pagination and Highlight reads run sequentially using the
+same Chromium profile; a large scan can take several watcher cycles. Each archive
+queue attempts at most five media downloads per cycle with a 90-second download
+budget. Slow Telegram requests can extend the total cycle.
+
+Set `IG_CATALOG_ENABLED=0` to disable posts and Highlights while retaining Story
+archiving. Set `IG_DOWNLOAD_DIR` to another host directory if desired. After changing
+settings, recreate the watcher with `./igctl up -d --force-recreate ig-watch`.
+
+Archive and Telegram state are tracked independently under `data/watch/` (or
+`IG_DATA_DIR/watch/`): `archive-<target>.json`, `catalog-<target>.json`, and their
+`.required` markers protect download history and stable numbering. Do not delete
+these to retry a download. Downloaded files and credentials are excluded from Git
+and Docker build contexts; keep state and download backups private.
+
+Downloads validate the CDN host, redirects, size and file signature, then rename
+`.part` files atomically. Failures remain queued and trigger supervisor/watchdog
+alerts with recovery notifications. Story downloads retire after seven days with
+an unresolved alert; catalog downloads remain pending. Saved files are not periodically
+revalidated, and manually deleted successful files are not automatically restored.
+Telegram retries can produce duplicate messages if an acknowledgement is lost.
+
+Check `WATCH_MEDIA_STARTED` for `archiveEnabled:true` and `catalogEnabled:true`,
+`STORY_ARCHIVE_SAVED` / `CATALOG_MEDIA_SAVED` for saved files, and `CATALOG_STATUS`
+for baseline completion and pending work. `STORY_MEDIA_SENT` alone does not mean
+a file was archived. Verify downloaded files on the host as well.
+
+Posts and Highlights use private read-only GraphQL queries with an exact request
+allowlist; the Story guard remains unchanged. `IG_POSTS_DOC_ID` and
+`IG_POSTS_PAGE_DOC_ID` can override post query IDs. Instagram API changes, session
+expiry, rate limits, and unsupported response pagination are reported as errors
+rather than an empty or complete scan. The test suite uses controlled fixtures;
+it does not verify live Instagram compatibility.
 
 ## Requirements
 

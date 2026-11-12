@@ -17,3 +17,6 @@ coverage/
 .codebase-memory/
 .DS_Store
 *.tmp
+
+# Downloaded Instagram media
+downloads/
