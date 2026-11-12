@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
 
-for (const name of ['watch-media', 'watch-story']) {
+for (const name of ['watch-story']) {
   for (const telegramOnly of [false, true]) {
     test(`${name}: ${telegramOnly ? 'Telegram test skips lookup' : 'username resolves before numeric history is opened'}`, async () => {
       const source = (await fs.readFile(new URL(`../src/${name}.mjs`, import.meta.url), 'utf8'))

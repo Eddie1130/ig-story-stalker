@@ -9,6 +9,7 @@ services:
     shm_size: "512mb"
     environment:
       TZ: Asia/Hong_Kong
+      IG_TARGET_USERNAMES: ${IG_TARGET_USERNAMES:-}
       IG_TARGET_USERNAME: ${IG_TARGET_USERNAME:-}
       IG_TARGET_USER_ID: ${IG_TARGET_USER_ID:-}
     volumes:

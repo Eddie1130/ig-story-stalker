@@ -36,9 +36,9 @@ export async function drain(state, send, persist, describe, onSent = () => {}) {
     onSent(story.id);
   }
 }
-export function fetchStories(script, onChild = () => {}, timeoutMs = 120000) {
+export function fetchStories(script, onChild = () => {}, timeoutMs = 120000, env = process.env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
     onChild(child);
     let result, event = 'FETCH_FAILED', expired = false;
     const timer = setTimeout(() => {
@@ -51,7 +51,7 @@ export function fetchStories(script, onChild = () => {}, timeoutMs = 120000) {
         const row = JSON.parse(line);
         if (row.event === 'STORY_FETCH_SUCCESS') result = row;
         // RELIABILITY_FETCH_EVENTS_V1
-        else if (/ERROR|INVALID|FATAL|FAILURE|FALLBACK/.test(row.event || '')) {
+        else if (!event.startsWith('SESSION_INVALID') && /ERROR|INVALID|FATAL|FAILURE|FALLBACK/.test(row.event || '')) {
           event = [row.event, Number.isFinite(row.status) ? 'http=' + row.status : '',
             Number.isFinite(row.errorCode) ? 'code=' + row.errorCode : ''].filter(Boolean).join(':');
         }

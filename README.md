@@ -1,6 +1,6 @@
 # IG Story Stalker
 
-A self-hosted Instagram Story watcher that reuses a manually authenticated Chromium profile, checks one account for new Stories, delivers available photos and videos to Telegram, and archives Stories, posts, and Highlights to disk.
+A self-hosted Instagram Story watcher that reuses a manually authenticated Chromium profile, checks one or more accounts for new Stories, delivers available photos and videos to Telegram, and archives Stories, posts, and Highlights to disk.
 
 The project is designed for unattended Docker deployments. It includes a fail-closed network guard, persistent delivery state, health checks, a supervising worker, and an independent watchdog.
 
@@ -13,6 +13,7 @@ The project is designed for unattended Docker deployments. It includes a fail-cl
 
 - Manual Instagram login through a temporary noVNC container
 - Persistent Chromium session stored outside the image
+- Multiple target accounts with independent download folders, delivery history and retries
 - Headless Story checks with configurable intervals and exponential backoff
 - Direct Telegram delivery for supported Story photos and videos
 - Deduplication and durable retry state across restarts
@@ -29,13 +30,18 @@ An existing `.env` also uses these defaults without adding new variables.
 
 ```text
 downloads/
-  stories/20261016_013000_JST_123456.mp4
-  posts/00001_20261016_013000_JST/
-    01.jpg
-    02.mp4
-    caption.txt
-  highlight/01_旅行/
-    001_20261016_013000_JST.jpg
+  alice/
+    stories/20261016_013000_JST_123456.mp4
+    posts/00001_20261016_013000_JST/
+      01.jpg
+      02.mp4
+      caption.txt
+    highlight/01_旅行/
+      001_20261016_013000_JST.jpg
+  bob/
+    stories/
+    posts/
+    highlight/
 ```
 
 Filenames use publication time in JST, with detection time as the Story fallback.
@@ -50,6 +56,17 @@ notifications. Later discoveries are downloaded and sent individually to Telegra
 Story archiving is independent of Telegram delivery, so currently available Stories
 can be archived even if already sent. Expired or deleted Stories cannot be recovered
 unless their media remains accessible. The dedicated Reels tab is not scanned.
+
+All accounts share the saved login, Telegram chat and polling settings. Checks run
+sequentially, with a two-second pause between accounts; a slow account can delay
+later accounts. Telegram media captions and account alerts identify the source.
+Each account has independent fetch backoff, archive queues, post numbering and
+baseline scans. A failed lookup, fetch, or damaged account history leaves other
+accounts running. Damaged histories are never replaced with empty state; account
+initialization/storage failures retry every five minutes and remain visible in health.
+A shared login/challenge failure pauses all accounts, emits an alert, and probes the
+login every five minutes before resuming. Telegram rate-limit waits apply to the
+shared destination across accounts.
 
 Stories use `IG_CHECK_INTERVAL_SECONDS` (default 300). Post scans and Highlight
 scans use `IG_POSTS_INTERVAL_SECONDS` and `IG_HIGHLIGHTS_INTERVAL_SECONDS` (default
@@ -87,11 +104,33 @@ expiry, rate limits, and unsupported response pagination are reported as errors
 rather than an empty or complete scan. The test suite uses controlled fixtures;
 it does not verify live Instagram compatibility.
 
+### Upgrading existing downloads
+
+Stop the old watcher before upgrading, and keep a private backup of `data/` and
+`downloads/`. On the first successful initialization, the worker moves the old root
+`stories/`, `posts/` and `highlight/` directories under their original account folder.
+It identifies ownership from the numeric-ID histories, preserves those histories and
+Telegram sent IDs, and records the layout in `data/watch/archive-layout.json` plus
+its `.required` marker. A journal resumes interrupted directory moves after restart.
+Do not delete these layout files or move account folders manually.
+
+The old account can appear anywhere in the new list. If it is removed or cannot be
+resolved during migration, its retained archive uses its numeric ID as the folder
+name. Accounts named `stories`, `posts`, or `highlight` use `<username>_<ID>` to avoid
+colliding with legacy directories. Folder assignments remain stable by numeric ID
+if a username later changes. Removed accounts' files and histories remain on disk.
+
+If legacy ownership is ambiguous, the destination already contains conflicting
+files, or a directory is a symlink, migration fails visibly without overwriting
+files. Resolve the reported layout conflict using your backup before retrying.
+Keep the old account configured during the upgrade so its outstanding supervisor
+alerts can also migrate and recover under the correct account identity.
+
 ## Requirements
 
 - Docker Engine with Docker Compose v2
 - A Telegram bot token and destination chat ID
-- The target account's Instagram username
+- The target accounts' Instagram usernames
 - Network access to Instagram and the Telegram Bot API
 
 No host-level Node.js installation is required for normal use. Node.js 22 or newer is only needed for local syntax checks.
@@ -108,18 +147,18 @@ chmod 600 .env .env.telegram
 
 Edit both files:
 
-- `IG_TARGET_USERNAME` identifies the account to monitor (username only, without `@`).
-- `IG_TARGET_USER_ID` is optional. Leave it unset to resolve the numeric ID automatically using your authenticated session. Existing values override lookup.
+- `IG_TARGET_USERNAMES=alice,bob,charlie` selects the accounts (usernames only, without `@`). Whitespace is trimmed and duplicate names are ignored, case-insensitively. Restart the watcher after editing the list.
+- A nonempty `IG_TARGET_USERNAMES` takes precedence over both legacy target variables. Each username is resolved separately; a stale `IG_TARGET_USER_ID` cannot override the list.
+- If the list is unset or empty, the original `IG_TARGET_USERNAME` and optional `IG_TARGET_USER_ID` still work. In legacy mode a numeric ID skips lookup.
 - `IG_CHECK_INTERVAL_SECONDS` must be between 60 and 86400.
 - `VNC_PASSWORD` must be unique and at least 8 characters.
 - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` control delivery.
 
-Automatic lookup runs once at worker startup and again after a worker restart. It uses
+Automatic lookup runs once per account per worker lifetime; failed lookups retry independently. It uses
 the saved Instagram session to read the target profile page and extract its numeric ID
 from embedded account or route data. It updates only the running process environment and keeps
-history keyed by numeric ID. It does not write to `.env`. Lookup failures (including
-rate limits, expired sessions, or an unexpected account response) stop startup and
-are retried by the supervisor. `TARGET_RESOLVED` records a successful lookup.
+history keyed by numeric ID. It does not write to `.env`. Lookup failures (including rate limits or an unexpected account response) back off
+for that account while other targets continue. An expired shared session pauses all targets. `TARGET_RESOLVED` records a successful lookup.
 The Telegram-only test does not require an Instagram lookup.
 
 The default noVNC binding is `127.0.0.1:6080`. Keep it local whenever possible.
@@ -190,8 +229,9 @@ Stop all monitoring services with:
 
 | Variable | File | Required | Description |
 | --- | --- | --- | --- |
-| `IG_TARGET_USERNAME` | `.env` | Yes, unless ID is supplied | Account username; used to resolve the numeric ID and in messages |
-| `IG_TARGET_USER_ID` | `.env` | No | Optional numeric ID override; resolved automatically when omitted |
+| `IG_TARGET_USERNAMES` | `.env` | Unless legacy target is supplied | Comma-separated usernames; takes precedence over legacy variables |
+| `IG_TARGET_USERNAME` | `.env` | Legacy fallback | Single account username, used when the list is empty |
+| `IG_TARGET_USER_ID` | `.env` | No | Optional ID override in legacy single-account mode only |
 | `IG_CHECK_INTERVAL_SECONDS` | `.env` | No | Base polling interval; defaults to `300` |
 | `VNC_PASSWORD` | `.env` | For login | Password for the temporary noVNC session |
 | `NOVNC_BIND_ADDRESS` | `.env` | No | Host address for noVNC; defaults to `127.0.0.1` |
@@ -203,13 +243,13 @@ Stop all monitoring services with:
 
 ## Useful commands
 
-Run one Story fetch without Telegram delivery:
+Run one Story fetch for a selected username without Telegram delivery (replace `alice`):
 
 ```sh
-docker compose run --rm ig-check node /app/src/fetch-story.mjs
+docker compose run --rm -e IG_TARGET_USERNAME=alice -e IG_TARGET_USER_ID= -e IG_TARGET_USERNAMES= ig-check node /app/src/fetch-story.mjs
 ```
 
-Run one complete media check and delivery cycle:
+Run one complete media check and delivery cycle for all configured accounts:
 
 ```sh
 ./igctl run --rm ig-watch node /app/src/watch-media.mjs --once
@@ -257,7 +297,7 @@ Instagram session profile
                       watchdog -----> Telegram alerts
 ```
 
-The browser worker bootstraps an authenticated Instagram page and performs one allow-listed Story GraphQL query for the configured numeric account ID. The network guard blocks known seen/read operations and rejects other Instagram write requests. Story media URLs are passed through a private temporary file, delivered to Telegram, and never written to the audit log.
+The browser worker bootstraps an authenticated Instagram page and performs one allow-listed Story GraphQL query per configured numeric account ID, sequentially. The network guard blocks known seen/read operations and rejects other Instagram write requests. Story media URLs are passed through a private temporary file, delivered to Telegram, and never written to the audit log.
 
 ## Troubleshooting
 

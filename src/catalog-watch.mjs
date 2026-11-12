@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { atomic } from './error-monitor.mjs';
 import { downloadStory, archiveReason } from './story-archive.mjs';
 import { validMediaUrl } from './story-media.mjs';
+import { sessionInvalid } from './targets.mjs';
 import { idOK, highlightId } from './catalog-api.mjs';
 
 export function dateJST(seconds) {
@@ -22,16 +23,16 @@ const hash=text=>createHash('sha256').update(text).digest('hex');
 const obj=v=>v && typeof v==='object' && !Array.isArray(v);
 const safeReason=e=>/^CATALOG_[A-Z0-9_]+$/.test(e?.message||'')?e.message:archiveReason(e);
 const sequence=n=>String(n).padStart(5,'0');
-export async function fetchCatalog(plan,{signal,onChild=()=>{},script='/app/src/fetch-catalog.mjs'}={}) {
+export async function fetchCatalog(plan,{signal,onChild=()=>{},script='/app/src/fetch-catalog.mjs',env=process.env}={}) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ig-catalog-')),result=path.join(dir,'result.json');
   try {
     await new Promise((resolve,reject)=>{
-      const child=spawn(process.execPath,[script],{detached:true,stdio:['ignore','pipe','pipe'],env:{...process.env,IG_CATALOG_PLAN:JSON.stringify(plan),IG_CATALOG_RESULT_FILE:result}});
+      const child=spawn(process.execPath,[script],{detached:true,stdio:['ignore','pipe','pipe'],env:{...env,IG_CATALOG_PLAN:JSON.stringify(plan),IG_CATALOG_RESULT_FILE:result}});
       onChild(child);let success=false,reason='CATALOG_FETCH_FAILED';
       const kill=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
       const timer=setTimeout(()=>{reason='CATALOG_FETCH_TIMEOUT';kill();},115000);
       signal?.addEventListener('abort',kill,{once:true});if(signal?.aborted)kill();
-      readline.createInterface({input:child.stdout}).on('line',line=>{try{const r=JSON.parse(line);if(r.event==='CATALOG_HTTP_DIAGNOSTIC'&&['tray','highlight'].includes(r.kind)&&Number.isInteger(r.status)&&['www.instagram.com','i.instagram.com'].includes(r.host))console.log(JSON.stringify({ts:new Date().toISOString(),event:r.event,kind:r.kind,transport:'context_request',status:r.status,host:r.host,redirects:r.redirects}));if(r.event==='CATALOG_FETCH_SUCCESS')success=true;if(r.event==='CATALOG_FETCH_ERROR'&&/^CATALOG_[A-Z0-9_]+$/.test(r.reason))reason=r.reason;}catch{}});
+      readline.createInterface({input:child.stdout}).on('line',line=>{try{const r=JSON.parse(line);if(r.event==='CATALOG_HTTP_DIAGNOSTIC'&&['tray','highlight'].includes(r.kind)&&Number.isInteger(r.status)&&['www.instagram.com','i.instagram.com'].includes(r.host))console.log(JSON.stringify({ts:new Date().toISOString(),event:r.event,target:env.IG_TARGET_USER_ID,username:env.IG_TARGET_USERNAME,kind:r.kind,transport:'context_request',status:r.status,host:r.host,redirects:r.redirects}));if(r.event==='CATALOG_FETCH_SUCCESS')success=true;if(r.event==='CATALOG_FETCH_ERROR'&&/^CATALOG_[A-Z0-9_]+$/.test(r.reason))reason=r.reason;}catch{}});
       child.stderr.resume();
       child.on('error',()=>{reason='CATALOG_PROCESS_START_ERROR';});
       child.on('close',code=>{clearTimeout(timer);signal?.removeEventListener('abort',kill);onChild(null);if(code===0&&success&&!signal?.aborted)resolve();else reject(Error(reason));});
@@ -125,6 +126,7 @@ export class CatalogWatcher {
       try {const result=await this.fetcher(plan,{signal,onChild});this.ingest(plan,result);}
       catch(e){
         this.state=JSON.parse(snapshot);if(signal.aborted)return;
+        if(sessionInvalid(e))throw Error('SHARED_SESSION_INVALID');
         const failed=this.state[group];failed.failures++;
         failed.nextAt=Date.now()+Math.min(3600,300*2**Math.min(failed.failures,4))*1000;
         if (plan.kind === 'highlight') {

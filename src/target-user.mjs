@@ -91,3 +91,25 @@ export function profileUserId(scripts, username) {
   if (ids.size !== 1) throw Error('TARGET_LOOKUP_INVALID_USER');
   return [...ids][0];
 }
+
+// Probe only the shared authentication, independent of any target's availability.
+export async function ensureAuthenticated(log = () => {}, browser = chromium) {
+  let context, failure;
+  try {
+    context = await browser.launchPersistentContext('/data/profile', {
+      executablePath: '/usr/bin/chromium', headless: true, serviceWorkers: 'block',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const guard = await installNetworkGuard(context, log, { blockSubresources: true });
+    const page = context.pages()[0] ?? await context.newPage();
+    const response = await page.goto('https://www.instagram.com/accounts/edit/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    const pathname = new URL(page.url()).pathname;
+    if (/^\/(?:accounts\/login|challenge|checkpoint)(?:\/|$)/i.test(pathname)) throw Error('TARGET_SESSION_INVALID');
+    if (response?.status() !== 200 || pathname !== '/accounts/edit/' || guard.blockedReadReceipt) throw Error('TARGET_SESSION_PROBE_FAILED');
+  } catch (error) {
+    failure = /^TARGET_[A-Z0-9_]+$/.test(error.message) ? error : Error('TARGET_SESSION_PROBE_FAILED');
+    throw failure;
+  } finally {
+    try { await context?.close(); } catch { if (!failure) throw Error('TARGET_BROWSER_CLOSE_ERROR'); }
+  }
+}

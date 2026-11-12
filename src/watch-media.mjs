@@ -1,5 +1,8 @@
-import { ensureTargetUserId } from './target-user.mjs';
-import { CatalogWatcher } from './catalog-watch.mjs';
+import { ensureAuthenticated } from './target-user.mjs';
+import { configuredTargets, resolveTarget, sessionInvalid, aggregateHealth } from './targets.mjs';
+import { accountArchiveRoot } from './archive-layout.mjs';
+import { pathToFileURL } from 'node:url';
+import { CatalogWatcher, fetchCatalog } from './catalog-watch.mjs';
 import { StoryArchive } from './story-archive.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -7,19 +10,186 @@ import os from 'node:os';
 import { save, fetchStories } from './watch-story.mjs';
 import { mediaRequest, validMediaUrl, enqueue, deliver, mediaFailureReason } from './story-media.mjs';
 
-const log = (event, data = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
-async function main() {
-  const target = process.argv.includes('--test-telegram')
-    ? process.env.IG_TARGET_USER_ID || '0'
-    : await ensureTargetUserId(process.env, log);
-  const username = process.env.IG_TARGET_USERNAME || target;
-  const token = process.env.TELEGRAM_BOT_TOKEN || '';
-  const chatId = process.env.TELEGRAM_CHAT_ID || '';
-  const interval = Number(process.env.IG_CHECK_INTERVAL_SECONDS || 300);
-  if (!/^\d+$/.test(target) || !/^\d+:[A-Za-z0-9_-]+$/.test(token) || !chatId ||
-      !Number.isInteger(interval) || interval < 60 || interval > 86400) throw Error('INVALID_CONFIG');
-  const dir = '/app/state';
+const emit = (event, data = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
+
+export async function main({ env = process.env, args = process.argv, dir = '/app/state', resolve = resolveTarget, fetcher = fetchStories, checkSession = ensureAuthenticated, sleepImpl } = {}) {
+  const configs = configuredTargets(env);
+  const token = env.TELEGRAM_BOT_TOKEN || '';
+  const chatId = env.TELEGRAM_CHAT_ID || '';
+  const interval = Number(env.IG_CHECK_INTERVAL_SECONDS || 300);
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token) || !chatId || !Number.isInteger(interval) || interval < 60 || interval > 86400) throw Error('INVALID_CONFIG');
   fs.mkdirSync(dir, { recursive: true });
+  let stopping = false, child = null, wake = () => {};
+  const aborter = new AbortController();
+  const control = { get stopping() { return stopping; }, signal: aborter.signal, onChild: value => { child = value; } };
+  const stop = () => {
+    stopping = true; aborter.abort();
+    if (child) try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    wake();
+  };
+  const sleep = delay => sleepImpl ? sleepImpl(delay) : new Promise(resolve => {
+    const timer = setTimeout(resolve, delay);
+    wake = () => { clearTimeout(timer); resolve(); };
+    if (stopping) wake();
+  });
+  // One Telegram limiter for the shared destination, including retry_after across accounts.
+  const rateFile = path.join(dir, 'telegram-rate.json');
+  let lastSendAt = 0, retryAt = 0;
+  if (fs.existsSync(rateFile)) {
+    try { retryAt = JSON.parse(fs.readFileSync(rateFile, 'utf8')).retryAt; }
+    catch { throw Error('INVALID_TELEGRAM_RATE_STATE'); }
+    if (!Number.isFinite(retryAt) || retryAt < 0) throw Error('INVALID_TELEGRAM_RATE_STATE');
+  }
+  const telegram = async (method, body, state = {}, persist = () => {}) => {
+    if (Date.now() < Math.max(retryAt, state.telegramRetryAt || 0)) throw Error('TELEGRAM_RETRY_WAIT');
+    await sleep(Math.max(0, 1100 - (Date.now() - lastSendAt)));
+    if (stopping) throw Error('TELEGRAM_STOPPING');
+    lastSendAt = Date.now();
+    let response, data;
+    try {
+      response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST', signal: AbortSignal.any([aborter.signal, AbortSignal.timeout(120000)]),
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, chat_id: chatId }),
+      });
+      data = await response.json();
+    } catch { throw Error('TELEGRAM_NETWORK_OR_RESPONSE_ERROR'); }
+    if (!response.ok || data.ok !== true) {
+      const retry = Number(data.parameters?.retry_after);
+      if (Number.isFinite(retry) && retry > 0) {
+        retryAt = state.telegramRetryAt = Date.now() + retry * 1000;
+        save(rateFile, { retryAt }); persist();
+      }
+      throw Error(`TELEGRAM_ERROR_${data.error_code || response.status}`);
+    }
+    state.telegramRetryAt = 0;
+  };
+  if (args.includes('--test-telegram')) {
+    await telegram('sendMessage', { text: `IG 媒體通知設定成功\n${configs.map(c => '@' + c.username).join(', ')}\n每 ${interval} 秒檢查；圖片／影片將直接傳送。` });
+    emit('TELEGRAM_TEST_OK'); return;
+  }
+  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, stop);
+  const entries = configs.map(config => ({ config, watcher: null, failures: 0, nextFetchAt: 0, retryAt: 0, error: null,
+    status() {
+      const status = this.watcher ? this.watcher.status() : { username: this.config.username, failures: this.failures, nextFetchAt: this.nextFetchAt, telegramOk: true, archiveOk: true, catalogOk: true };
+      return this.error ? { ...status, failures: Math.max(3, status.failures), nextFetchAt: this.retryAt } : status;
+    },
+  }));
+  let sessionBlocked = null, sessionAlerted = false, sessionRecoveryPending = false;
+  const notifySession = async () => {
+    if (env.IG_EXTERNAL_ERROR_MONITOR === '1') return;
+    if (!sessionBlocked) {
+      if (sessionRecoveryPending) {
+        try { await telegram('sendMessage', { text: 'IG 共用登入已恢復，繼續監看所有帳號。' }); sessionRecoveryPending = false; }
+        catch (error) { emit('TELEGRAM_DELIVERY_FAILED', { reason: error.message }); }
+      }
+      return;
+    }
+    if (sessionAlerted) return;
+    try {
+      await telegram('sendMessage', { text: 'IG 共用登入已失效，所有帳號暫停檢查。請重新登入；系統每五分鐘確認登入狀態。' });
+      sessionAlerted = true;
+    } catch (error) { emit('TELEGRAM_DELIVERY_FAILED', { reason: error.message }); }
+  };
+  const health = () => save(path.join(dir, 'health.json'), { ...aggregateHealth(entries), sessionOk: !sessionBlocked, ...(sessionBlocked ? { failures: 3 } : {}) });
+  const heartbeat = setInterval(() => {
+    try { health(); } catch { emit('WATCH_FATAL', { reason: 'HEALTH_WRITE_FAILED' }); process.exit(1); }
+  }, 30000);
+  const ids = new Set();
+  emit('WATCH_MEDIA_STARTED', { targetCount: entries.length, intervalSeconds: interval,
+    archiveEnabled: !!env.IG_ARCHIVE_DIR, catalogEnabled: env.IG_CATALOG_ENABLED === '1' });
+  try {
+    while (!stopping) {
+      if (sessionBlocked) {
+        try {
+          // Clear any cached numeric ID: validate the shared login before resuming other targets.
+          await checkSession(emit);
+          sessionBlocked = null; emit('SHARED_SESSION_RECOVERED');
+          sessionRecoveryPending = sessionAlerted; sessionAlerted = false;
+        } catch {
+          emit('SHARED_SESSION_INVALID'); await notifySession();
+          if (args.includes('--once')) { process.exitCode = 1; break; }
+          emit('WATCH_WAIT', { seconds: 300 }); await sleep(300000); continue;
+        }
+      }
+      // Resolve all due usernames first, so legacy ownership can be named even when
+      // the old account is not the first entry in the new list.
+      for (const entry of entries) {
+        if (stopping || sessionBlocked) break;
+        if (entry.target || Date.now() < entry.nextFetchAt) continue;
+        const { config } = entry;
+        const log = (event, data = {}) => emit(event, { ...data, username: config.username, target: config.username });
+        try {
+          const target = await resolve(config, env, log);
+          if (ids.has(target)) throw Error('DUPLICATE_TARGET_ACCOUNT');
+          ids.add(target); entry.target = target; entry.failures = 0;
+        } catch (error) {
+          if (error.message === 'DUPLICATE_TARGET_ACCOUNT') throw error;
+          entry.failures++;
+          entry.nextFetchAt = Date.now() + Math.min(interval * 2 ** Math.min(entry.failures, 5), Math.max(interval, 1800)) * 1000;
+          log('WATCH_CHECK_FAILED', { reason: error.message, consecutiveFailures: entry.failures });
+          if (sessionInvalid(error)) { sessionBlocked = config; emit('SHARED_SESSION_INVALID'); break; }
+        }
+        if (entries.length > 1 && entry !== entries.at(-1) && !stopping) {
+          emit('WATCH_TARGET_PAUSE', { seconds: 2 }); await sleep(2000);
+        }
+      }
+      const ownerNames = Object.fromEntries(entries.filter(e => e.target).map(e => [e.target, e.config.username]));
+      for (const entry of entries) {
+        if (stopping || sessionBlocked) break;
+        if (!entry.target || Date.now() < entry.retryAt) continue;
+        const { config, target } = entry;
+        try {
+          if (!entry.watcher) {
+            const root = env.IG_ARCHIVE_DIR ? accountArchiveRoot(env.IG_ARCHIVE_DIR, dir, target, config.username, ownerNames) : null;
+            entry.watcher = createTargetWatcher({ target, username: config.username, dir, root, interval, control, telegram, env, fetcher });
+            emit('WATCH_TARGET_READY', { target, username: config.username });
+          }
+          await entry.watcher.cycle();
+          emit('WATCH_TARGET_COMPLETED', { target, username: config.username });
+          entry.error = null; entry.retryAt = 0;
+        } catch (error) {
+          if (error.message === 'SHARED_SESSION_INVALID') { sessionBlocked = config; emit('SHARED_SESSION_INVALID'); break; }
+          // Preserve the in-memory queue after a failed write. Only this account pauses.
+          entry.error = error.code || (/^[A-Z0-9_]+$/.test(error.message) ? error.message : 'TARGET_RUNTIME_ERROR');
+          entry.retryAt = Date.now() + 300000;
+          emit('WATCH_TARGET_FAILED', { target, username: config.username, reason: entry.error });
+        }
+        health();
+        if (entries.length > 1 && entry !== entries.at(-1) && !stopping) {
+          emit('WATCH_TARGET_PAUSE', { seconds: 2 }); await sleep(2000);
+        }
+      }
+      await notifySession();
+      if (env.IG_EXTERNAL_ERROR_MONITOR !== '1') {
+        for (const entry of entries) {
+          const reason = entry.error || (entry.failures >= 3 ? 'TARGET_LOOKUP_FAILED' : null);
+          if (reason === (entry.notifiedReason || null)) continue;
+          try {
+            await telegram('sendMessage', { text: reason
+              ? `IG 帳號監看異常：@${entry.config.username}\n${reason}\n此帳號將獨立重試，其他帳號繼續檢查。`
+              : `IG 帳號監看已恢復：@${entry.config.username}` });
+            entry.notifiedReason = reason;
+          } catch (error) { emit('TELEGRAM_DELIVERY_FAILED', { username: entry.config.username, reason: error.message }); }
+        }
+      }
+      health();
+      if (args.includes('--once')) {
+        const status = aggregateHealth(entries);
+        process.exitCode = sessionBlocked || status.failures || !status.telegramOk || !status.archiveOk || !status.catalogOk ? 1 : 0;
+        break;
+      }
+      const delay = sessionBlocked ? 300000 : Math.max(1000, Math.min(interval * 1000, ...entries.map(e => e.status().nextFetchAt - Date.now())));
+      emit('WATCH_WAIT', { seconds: Math.ceil(delay / 1000) }); await sleep(delay);
+    }
+  } finally {
+    clearInterval(heartbeat);
+    for (const signal of ['SIGTERM', 'SIGINT']) process.off(signal, stop);
+  }
+  emit('WATCH_STOPPED');
+}
+
+export function createTargetWatcher({ target, username, dir, root, interval, control, telegram, env = process.env, fetcher = fetchStories }) {
+  const log = (event, data = {}) => emit(event, { ...data, target, username });
   const file = path.join(dir, `watch-media-${target}.json`);
   let state = { version: 2, target, sent: {}, pending: {}, failures: 0, alerted: false, telegramRetryAt: 0 };
   // RELIABILITY_STATE_SENTINEL_V1
@@ -36,78 +206,38 @@ async function main() {
   const markHistory = () => { if (!fs.existsSync(required)) fs.writeFileSync(required, 'history-required', { mode: 0o600, flag: 'wx' }); };
   if (fs.existsSync(file)) markHistory();
   const persist = () => { save(file, state); markHistory(); };
-  let stopping = false, child = null, wake = () => {}, heartbeat;
-  const aborter = new AbortController();
-  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
-    stopping = true;
-    aborter.abort();
-    if (child) try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-    wake();
-  });
-  let lastSendAt = 0;
-  const callTelegram = async (method, body) => {
-    if (Date.now() < (state.telegramRetryAt || 0)) throw Error('TELEGRAM_RETRY_WAIT');
-    const wait = Math.max(0, 1100 - (Date.now() - lastSendAt));
-    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
-    if (stopping) throw Error('TELEGRAM_STOPPING');
-    lastSendAt = Date.now();
-    let response, data;
-    try {
-      response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-        method: 'POST', signal: AbortSignal.any([aborter.signal, AbortSignal.timeout(120000)]),
-        headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-      });
-      data = await response.json();
-    } catch { throw Error('TELEGRAM_NETWORK_OR_RESPONSE_ERROR'); }
-    if (!response.ok || data.ok !== true) {
-      const retry = Number(data.parameters?.retry_after);
-      if (Number.isFinite(retry) && retry > 0) { state.telegramRetryAt = Date.now() + retry * 1000; persist(); }
-      // Do not log Telegram descriptions: they can repeat signed CDN URLs.
-      throw Error(`TELEGRAM_ERROR_${data.error_code || response.status}`);
-    }
-    state.telegramRetryAt = 0;
-  };
-  // RELIABILITY_MEDIA_V1: supervisor/watchdog owns error messages in daemon mode.
-  const sendText = text => process.env.IG_EXTERNAL_ERROR_MONITOR === '1' && !process.argv.includes('--test-telegram')
+  const callTelegram = (method, body) => telegram(method, body, state, persist);
+  const sendText = text => env.IG_EXTERNAL_ERROR_MONITOR === '1'
     ? Promise.resolve()
-    : callTelegram('sendMessage', { chat_id: chatId, text, link_preview_options: { is_disabled: true } });
+    : callTelegram('sendMessage', { text, link_preview_options: { is_disabled: true } });
   const sendMedia = story => {
-    const request = mediaRequest(story, chatId);
+    const request = mediaRequest({ ...story, username }, '');
     return callTelegram(request.method, request.body);
   };
-  if (process.argv.includes('--test-telegram')) {
-    await sendText(`IG Story 媒體通知設定成功\n@${username}\n每 ${interval} 秒檢查；圖片／影片將直接傳送。`);
-    log('TELEGRAM_TEST_OK'); return;
-  }
-  const archive = process.env.IG_ARCHIVE_DIR ? new StoryArchive({
-    root: process.env.IG_ARCHIVE_DIR, stateDir: dir, target, log,
+  const archive = root ? new StoryArchive({
+    root: root, stateDir: dir, target, log,
   }) : null;
   // Include old Telegram retries, but keep archive history independent of sent IDs.
   if (archive) archive.enqueue(Object.values(state.pending));
-  const catalog = process.env.IG_CATALOG_ENABLED === '1' ? new CatalogWatcher({
-    root: process.env.IG_ARCHIVE_DIR || '', stateDir: dir, target, username, log,
-    postsInterval: Number(process.env.IG_POSTS_INTERVAL_SECONDS || 900),
-    highlightsInterval: Number(process.env.IG_HIGHLIGHTS_INTERVAL_SECONDS || 900),
+  const catalog = env.IG_CATALOG_ENABLED === '1' ? new CatalogWatcher({
+    root: root || '', stateDir: dir, target, username, log,
+    postsInterval: Number(env.IG_POSTS_INTERVAL_SECONDS || 900),
+    fetcher: (plan, options) => fetchCatalog(plan, { ...options, env: { ...env, IG_TARGET_USERNAMES: '', IG_TARGET_USERNAME: username, IG_TARGET_USER_ID: target } }),
+    highlightsInterval: Number(env.IG_HIGHLIGHTS_INTERVAL_SECONDS || 900),
   }) : null;
   let nextFetchAt = 0, telegramOk = true, archiveOk = true, catalogOk = true;
-  const health = () => save(path.join(dir, 'health.json'), {
-    at: Date.now(), failures: state.failures, telegramOk, archiveOk, catalogOk, nextFetchAt,
-  });
-  heartbeat = setInterval(() => {
-    try { health(); } catch { log('WATCH_FATAL', { reason: 'HEALTH_WRITE_FAILED' }); process.exit(1); }
-  }, 30000);
-  log('WATCH_MEDIA_STARTED', { target, intervalSeconds: interval, transport: 'telegram_url', archiveEnabled: !!archive, catalogEnabled: !!catalog });
-  try {
-    while (!stopping) {
+  return {
+    status: () => ({ target, username, failures: state.failures, telegramOk, archiveOk, catalogOk, nextFetchAt }),
+    async cycle() {
+      log('WATCH_TARGET_STARTED');
       if (Date.now() >= nextFetchAt) {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ig-media-'));
         const resultFile = path.join(temp, 'result.json');
-        const previous = process.env.IG_STORY_RESULT_FILE;
-        process.env.IG_STORY_RESULT_FILE = resultFile;
+
         let archiveStories = null;
         try {
-          const summary = await fetchStories('/app/src/fetch-story.mjs', c => { child = c; });
-          if (stopping) break;
+          const summary = await fetcher('/app/src/fetch-story.mjs', control.onChild, 120000, { ...env, IG_TARGET_USERNAMES: '', IG_TARGET_USERNAME: username, IG_TARGET_USER_ID: target, IG_STORY_RESULT_FILE: resultFile });
+          if (control.stopping) return;
           const media = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
           if (String(summary.targetUserId) !== target || summary.guard?.blockedReadReceipt !== 0 ||
               !Array.isArray(summary.stories) || summary.storyCount !== summary.stories.length ||
@@ -130,13 +260,12 @@ async function main() {
           log('WATCH_MEDIA_CHECK_OK', { storyCount: summary.storyCount, mediaCount: media.storyCount,
             skippedCount: media.skippedIds.length, skippedIds: media.skippedIds, mediaIds: media.stories.map(s => s.id), pendingCount: Object.keys(state.pending).length });
         } catch (error) {
-          if (stopping) break;
+          if (control.stopping) return;
           state.failures++;
           state.lastError = mediaFailureReason(error);
+          if (sessionInvalid(error)) { persist(); throw Error('SHARED_SESSION_INVALID'); }
           log('WATCH_CHECK_FAILED', { consecutiveFailures: state.failures, reason: state.lastError });
         } finally {
-          if (previous === undefined) delete process.env.IG_STORY_RESULT_FILE;
-          else process.env.IG_STORY_RESULT_FILE = previous;
           fs.rmSync(temp, { recursive: true, force: true });
         }
         // Persist outside the fetch catch: archive history errors must be fatal and visible.
@@ -145,7 +274,7 @@ async function main() {
         persist();
       }
       // Bounded download phase; Telegram still runs when archive downloads fail.
-      if (archive && !stopping) archiveOk = await archive.run(aborter.signal);
+      if (archive && !control.stopping) archiveOk = await archive.run(control.signal);
       try {
         telegramOk = true;
         if (state.failures >= 3 && !state.alerted) {
@@ -157,11 +286,11 @@ async function main() {
         }
         telegramOk = await deliver(state, sendMedia, persist,
           (id, mediaType) => log('STORY_MEDIA_SENT', { id, type: mediaType === 2 ? 'video' : 'photo' }),
-          (id, reason) => log('STORY_MEDIA_RETRY', { id, reason }), () => stopping);
+          (id, reason) => log('STORY_MEDIA_RETRY', { id, reason }), () => control.stopping);
         // A permanently unavailable URL must not block newer Story deliveries.
         const failed = Object.values(state.pending).filter(s => s.deliveryFailures >= 3 && !s.failureNotified).slice(0, 5);
         for (const story of failed) {
-          if (stopping) break;
+          if (control.stopping) return;
           await sendText(`Story 媒體傳送失敗：@${username}\nStory ${story.id}\n${story.deliveryError}\n已保留待重試；其他 Story 會繼續傳送。`);
           story.failureNotified = true; persist();
         }
@@ -180,25 +309,16 @@ async function main() {
           log('STORY_MEDIA_RETIRED', { id });
         }
       }
-      if (catalog && !stopping) {
-        await catalog.check(aborter.signal, c => { child = c; });
-        if (!stopping) catalogOk = await catalog.deliver(aborter.signal,
-          (method, body) => callTelegram(method, { ...body, chat_id: chatId }));
+      if (catalog && !control.stopping) {
+        await catalog.check(control.signal, control.onChild);
+        if (!control.stopping) catalogOk = await catalog.deliver(control.signal,
+          (method, body) => callTelegram(method, body));
       }
-      persist(); health();
-      if (process.argv.includes('--once')) {
-        process.exitCode = state.failures > 0 || !telegramOk || !archiveOk || !catalogOk ? 1 : 0;
-        break;
-      }
-      const delay = Math.max(1000, Math.min(interval * 1000, nextFetchAt - Date.now()));
-      log('WATCH_WAIT', { seconds: Math.ceil(delay / 1000), nextFetchAt: new Date(nextFetchAt).toISOString() });
-      await new Promise(resolve => {
-        const timer = setTimeout(resolve, delay);
-        wake = () => { clearTimeout(timer); resolve(); };
-        if (stopping) wake();
-      });
-    }
-  } finally { clearInterval(heartbeat); }
-  log('WATCH_STOPPED');
+      persist();
+    },
+  };
 }
-main().catch(error => { log('WATCH_FATAL', { reason: error.code || (/^[A-Z0-9_]+$/.test(error.message) ? error.message : 'UNEXPECTED_ERROR') }); process.exitCode = 1; });
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => { emit('WATCH_FATAL', { reason: error.code || (/^[A-Z0-9_]+$/.test(error.message) ? error.message : 'UNEXPECTED_ERROR') }); process.exitCode = 1; });
+}

@@ -30,18 +30,30 @@ export class Issues {
     if (!this.state || Array.isArray(this.state) || typeof this.state !== 'object') throw Error('INVALID_ISSUES_STATE');
     for (const entry of Object.values(this.state)) if (!entry || typeof entry.active !== 'boolean') throw Error('INVALID_ISSUE_ENTRY');
   }
-  fail(key, reason) {
+  fail(key, reason, label = this.target) {
     const old = this.state[key];
-    if (!old?.active || old.reason !== safe(reason)) queue(this.outbox, 'error', `IG 監控異常：${this.target}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`);
-    this.state[key] = { active: true, reason: safe(reason), firstAt: old?.active ? old.firstAt : Date.now(), lastAt: Date.now(), count: (old?.count || 0) + 1 };
+    if (!old?.active || old.reason !== safe(reason)) queue(this.outbox, 'error', `IG 監控異常：${label}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`);
+    this.state[key] = { active: true, label, reason: safe(reason), firstAt: old?.active ? old.firstAt : Date.now(), lastAt: Date.now(), count: (old?.count || 0) + 1 };
     atomic(this.file, this.state);
   }
   resolve(key) {
     const old = this.state[key];
     if (!old?.active) return;
-    queue(this.outbox, 'recovery', `IG 監控異常已解除：${this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`);
+    queue(this.outbox, 'recovery', `IG 監控異常已解除：${old.label || this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`);
     this.state[key] = { ...old, active: false, resolvedAt: Date.now() };
     atomic(this.file, this.state);
+  }
+  migrateAccount(username) {
+    // Before multi-target support all account incidents used unprefixed keys.
+    const accountKey = /^(?:fetch|nas-storage|catalog-storage|skipped-media|worker-telegram|(?:media|media-retired|missing-media|archive|catalog-fetch|catalog-archive|catalog-telegram|catalog-caption):.*)$/;
+    let changed = false;
+    for (const [key, issue] of Object.entries(this.state)) {
+      if (!accountKey.test(key)) continue;
+      const scoped = `target:${username}:${key}`;
+      if (!this.state[scoped]) this.state[scoped] = { ...issue, label: '@' + username };
+      delete this.state[key]; changed = true;
+    }
+    if (changed) atomic(this.file, this.state);
   }
   activeCount() { return Object.values(this.state).filter(x => x.active).length; }
 }
@@ -56,6 +68,8 @@ export function staleReason(health, now = Date.now()) {
 }
 export function eventIssue(row) {
   const event = row?.event;
+  if (event === 'WATCH_TARGET_FAILED') return ['target-runtime', row.reason || 'TARGET_RUNTIME_ERROR'];
+  if (event === 'SHARED_SESSION_INVALID') return ['shared-session', 'SESSION_INVALID_RELOGIN_REQUIRED'];
   if (event === 'CATALOG_CHECK_FAILED') return [`catalog-fetch:${safe(row.scope || row.group)}`, row.reason || 'CATALOG_FETCH_FAILED'];
   if (event === 'CATALOG_STORAGE_ERROR') return ['catalog-storage', row.reason || 'CATALOG_STORAGE_FAILED'];
   if (event === 'CATALOG_ARCHIVE_RETRY') return [`catalog-archive:${safe(row.key)}`, row.reason || 'CATALOG_ARCHIVE_FAILED'];

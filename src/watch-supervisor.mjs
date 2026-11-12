@@ -1,3 +1,4 @@
+import { targetIssueKey } from './targets.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -23,8 +24,17 @@ for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
   setTimeout(() => { if (worker?.pid) try { process.kill(-worker.pid, 'SIGKILL'); } catch {} }, 5000).unref();
 });
 async function main() {
-  const target = process.env.IG_TARGET_USERNAME || process.env.IG_TARGET_USER_ID || 'unknown';
+  const target = process.env.IG_TARGET_USERNAMES?.split(',').map(s => s.trim()).filter(Boolean).join(', @') || process.env.IG_TARGET_USERNAME || process.env.IG_TARGET_USER_ID || 'unknown';
   const issues = new Issues(path.join(dir, 'issues.json'), path.join(dir, 'outbox'), '@' + target);
+  // Inspect pre-start history before new target queues are created. This ties old
+  // unscoped incidents to the previous account rather than whichever succeeds first.
+  const stateDir = path.dirname(dir);
+  const priorIds = fs.readdirSync(stateDir).flatMap(name => {
+    const match = /^watch-media-(\d+)\.json$/.exec(name); return match ? [match[1]] : [];
+  });
+  const legacyId = process.env.IG_TARGET_USER_ID || (priorIds.length === 1 ? priorIds[0] : null);
+  const legacyUsername = process.env.IG_TARGET_USERNAME?.toLowerCase();
+  let legacyMigrated = false;
   const started = Date.now();
   let peerCheckBusy = false, peerAlerted = false, peerAttemptAt = 0;
   async function checkWatchdog() {
@@ -76,41 +86,56 @@ async function main() {
         try { row = JSON.parse(line); if (typeof row?.event !== 'string') throw Error(); }
         catch { issues.fail('worker-output', 'UNPARSEABLE_WORKER_OUTPUT'); return; }
         console.log(line);
-        const problem = eventIssue(row); if (problem) issues.fail(...problem);
+        if (!legacyMigrated && row.event === 'WATCH_TARGET_READY' &&
+            (legacyId ? row.target === legacyId : legacyUsername && row.username === legacyUsername)) {
+          issues.migrateAccount(row.username); legacyMigrated = true;
+        }
+        const globalKeys = new Set(['worker-exit', 'worker-fatal', 'worker-stall', 'worker-stderr', 'worker-output', 'shared-session']);
+        const accountIssues = {
+          fail: (key, reason) => issues.fail(globalKeys.has(key) ? key : targetIssueKey(row, key), reason, row.username ? '@' + row.username : undefined),
+          resolve: key => issues.resolve(globalKeys.has(key) ? key : targetIssueKey(row, key)),
+        };
+        if (row.event === 'WATCH_TARGET_COMPLETED') accountIssues.resolve('target-runtime');
+        if (row.event === 'SHARED_SESSION_RECOVERED') issues.resolve('shared-session');
+        if (['WATCH_TARGET_FAILED', 'WATCH_TARGET_COMPLETED', 'WATCH_TARGET_READY', 'WATCH_TARGET_STARTED', 'WATCH_TARGET_PAUSE', 'TARGET_RESOLVE_START', 'TARGET_RESOLVED', 'SHARED_SESSION_RECOVERED', 'SHARED_SESSION_INVALID'].includes(row.event)) {
+          health.workerDeadline = Date.now() + 150000;
+        }
+        const problem = eventIssue(row); if (problem) accountIssues.fail(...problem);
         const now = Date.now();
         health.lastEvent = row.event;
         if (row.event.startsWith('CATALOG_')) {
           health.workerDeadline = now + 150000;
-          if (row.event === 'CATALOG_CHECK_OK') issues.resolve(`catalog-fetch:${safe(row.scope || row.group)}`);
-          if (row.event === 'CATALOG_STORAGE_OK') issues.resolve('catalog-storage');
-          if (row.event === 'CATALOG_MEDIA_SAVED') issues.resolve(`catalog-archive:${safe(row.key)}`);
-          if (row.event === 'CATALOG_TELEGRAM_SENT') issues.resolve(`catalog-telegram:${safe(row.key)}`);
-          if (row.event === 'CATALOG_CAPTION_SAVED') issues.resolve(`catalog-caption:${safe(row.id)}`);
+          if (row.event === 'CATALOG_CHECK_OK') accountIssues.resolve(`catalog-fetch:${safe(row.scope || row.group)}`);
+          if (row.event === 'CATALOG_STORAGE_OK') accountIssues.resolve('catalog-storage');
+          if (row.event === 'CATALOG_MEDIA_SAVED') accountIssues.resolve(`catalog-archive:${safe(row.key)}`);
+          if (row.event === 'CATALOG_TELEGRAM_SENT') accountIssues.resolve(`catalog-telegram:${safe(row.key)}`);
+          if (row.event === 'CATALOG_CAPTION_SAVED') accountIssues.resolve(`catalog-caption:${safe(row.id)}`);
         } else if (row.event === 'NAS_STORAGE_OK') {
-          issues.resolve('nas-storage'); health.workerDeadline = now + 150000;
+          accountIssues.resolve('nas-storage'); health.workerDeadline = now + 150000;
         } else if (row.event === 'STORY_ARCHIVE_SAVED') {
-          issues.resolve(`archive:${safe(row.id)}`); health.workerDeadline = now + 150000;
+          accountIssues.resolve(`archive:${safe(row.id)}`); health.workerDeadline = now + 150000;
         } else if (['STORY_ARCHIVE_STARTED', 'STORY_ARCHIVE_RETRY', 'STORY_ARCHIVE_RETIRED', 'NAS_STORAGE_ERROR', 'WATCH_ARCHIVE_STATUS'].includes(row.event)) {
           health.workerDeadline = now + 150000;
         } else if (row.event === 'WATCH_MEDIA_STARTED') {
           health.phase = 'fetching'; health.workerDeadline = now + 150000;
         } else if (row.event === 'WATCH_MEDIA_CHECK_OK') {
+          issues.resolve('shared-session');
           health.phase = 'delivering';
           health.lastCheckAt = now; health.storyCount = row.storyCount;
           health.workerDeadline = now + 150000;
-          for (const key of ['fetch', 'worker-exit', 'worker-fatal', 'worker-stall', 'worker-stderr', 'worker-output']) issues.resolve(key);
-          if (row.skippedCount === 0) issues.resolve('skipped-media');
-          for (const id of row.skippedIds || []) issues.fail(`missing-media:${safe(id)}`, 'STORY_HAS_NO_MEDIA_VARIANT');
-          for (const id of row.mediaIds || []) issues.resolve(`missing-media:${safe(id)}`);
+          for (const key of ['fetch', 'worker-exit', 'worker-fatal', 'worker-stall', 'worker-stderr', 'worker-output']) accountIssues.resolve(key);
+          if (row.skippedCount === 0) accountIssues.resolve('skipped-media');
+          for (const id of row.skippedIds || []) accountIssues.fail(`missing-media:${safe(id)}`, 'STORY_HAS_NO_MEDIA_VARIANT');
+          for (const id of row.mediaIds || []) accountIssues.resolve(`missing-media:${safe(id)}`);
           restarts = 0;
         } else if (row.event === 'STORY_MEDIA_SENT') {
-          issues.resolve(`media:${safe(row.id)}`); issues.resolve('worker-telegram');
+          accountIssues.resolve(`media:${safe(row.id)}`); accountIssues.resolve('worker-telegram');
           health.workerDeadline = now + 150000;
         } else if (row.event === 'STORY_MEDIA_RETRY' || row.event === 'WATCH_CHECK_FAILED' || row.event === 'TELEGRAM_DELIVERY_FAILED') {
           health.workerDeadline = now + 150000;
         } else if (row.event === 'WATCH_WAIT') {
           if (!Number.isFinite(row.seconds) || row.seconds < 0 || row.seconds > 86400) {
-            issues.fail('worker-output', 'INVALID_WAIT_DURATION'); return;
+            accountIssues.fail('worker-output', 'INVALID_WAIT_DURATION'); return;
           }
           health.phase = 'waiting'; health.workerDeadline = now + row.seconds * 1000 + 150000;
         }

@@ -5,7 +5,7 @@ import { atomic, load, queue, Issues, staleReason, safe, log } from './error-mon
 
 const shared = process.env.IG_MONITOR_DIR || '/app/state/monitor';
 const own = process.env.IG_WATCHDOG_DIR || '/app/watchdog-state';
-const target = process.env.IG_TARGET_USERNAME || process.env.IG_TARGET_USER_ID || 'unknown';
+const target = process.env.IG_TARGET_USERNAMES?.split(',').map(s => s.trim()).filter(Boolean).join(', @') || process.env.IG_TARGET_USERNAME || process.env.IG_TARGET_USER_ID || 'unknown';
 if (process.argv.includes('--self-test')) {
   queue(path.join(own, 'outbox'), 'test', `IG 錯誤監控測試：@${target}\n警報已經過持久化佇列；收到這則訊息代表 watchdog 發送路徑正常。`);
   log('WATCHDOG_TEST_QUEUED');

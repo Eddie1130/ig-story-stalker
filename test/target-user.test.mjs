@@ -156,3 +156,15 @@ test('logged-in profile routes bind page_logging profile_id to the exact route u
     assert.throws(() => profileUserId(scripts, 'example.user'), /TARGET_LOOKUP_INVALID_USER/);
   }
 });
+
+test('shared authentication probes work without a target and fail closed on invalid sessions', async () => {
+  const { ensureAuthenticated } = await import('../src/target-user.mjs');
+  const good = browserFixture();
+  await ensureAuthenticated(() => {}, good.chromium);
+  assert.equal(good.calls.requests.length, 1); assert.equal(good.calls.closed, 1);
+  for (const [options, reason] of [[{ pathname: '/accounts/login/' }, /TARGET_SESSION_INVALID/], [{ status: 503 }, /TARGET_SESSION_PROBE_FAILED/]]) {
+    const f = browserFixture(options);
+    await assert.rejects(ensureAuthenticated(() => {}, f.chromium), reason);
+    assert.equal(f.calls.closed, 1);
+  }
+});
