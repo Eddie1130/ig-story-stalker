@@ -1,3 +1,4 @@
+import { ensureTargetUserId } from './target-user.mjs';
 import { CatalogWatcher } from './catalog-watch.mjs';
 import { StoryArchive } from './story-archive.mjs';
 import fs from 'node:fs';
@@ -8,7 +9,9 @@ import { mediaRequest, validMediaUrl, enqueue, deliver, mediaFailureReason } fro
 
 const log = (event, data = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...data }));
 async function main() {
-  const target = process.env.IG_TARGET_USER_ID || '';
+  const target = process.argv.includes('--test-telegram')
+    ? process.env.IG_TARGET_USER_ID || '0'
+    : await ensureTargetUserId(process.env, log);
   const username = process.env.IG_TARGET_USERNAME || target;
   const token = process.env.TELEGRAM_BOT_TOKEN || '';
   const chatId = process.env.TELEGRAM_CHAT_ID || '';

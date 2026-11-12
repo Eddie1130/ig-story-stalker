@@ -1,3 +1,4 @@
+import { ensureTargetUserId } from './target-user.mjs';
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 import { installNetworkGuard } from './network-guard.mjs';
@@ -7,7 +8,7 @@ const LOG_FILE = '/app/logs/audit.log';
 const CHROMIUM = '/usr/bin/chromium';
 
 const TARGET_USERNAME = process.env.IG_TARGET_USERNAME || '';
-const TARGET_USER_ID = process.env.IG_TARGET_USER_ID || '';
+let TARGET_USER_ID;
 
 const STORY_FRIENDLY_NAME = 'PolarisStoriesV3ReelPageStandaloneQuery';
 const STORY_DOC_ID = '29184890191114309';
@@ -30,12 +31,7 @@ function fail(code, event, data = {}) {
 let context;
 
 try {
-  if (!TARGET_USER_ID) {
-    fail(3, 'CONFIG_ERROR', {
-      message: 'IG_TARGET_USER_ID is required',
-    });
-    throw new Error('Missing IG_TARGET_USER_ID');
-  }
+  TARGET_USER_ID = await ensureTargetUserId(process.env, log);
 
   log('REQUEST_PATCH_VERSION', { version: 'HAR_AUTH_V2' });
   log('STORY_FETCH_START', {

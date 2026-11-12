@@ -91,7 +91,7 @@ it does not verify live Instagram compatibility.
 
 - Docker Engine with Docker Compose v2
 - A Telegram bot token and destination chat ID
-- The target account's numeric Instagram user ID
+- The target account's Instagram username
 - Network access to Instagram and the Telegram Bot API
 
 No host-level Node.js installation is required for normal use. Node.js 22 or newer is only needed for local syntax checks.
@@ -108,11 +108,18 @@ chmod 600 .env .env.telegram
 
 Edit both files:
 
-- `IG_TARGET_USERNAME` is used in logs and notifications.
-- `IG_TARGET_USER_ID` is the required numeric ID used by the Story query.
+- `IG_TARGET_USERNAME` identifies the account to monitor (username only, without `@`).
+- `IG_TARGET_USER_ID` is optional. Leave it unset to resolve the numeric ID automatically using your authenticated session. Existing values override lookup.
 - `IG_CHECK_INTERVAL_SECONDS` must be between 60 and 86400.
 - `VNC_PASSWORD` must be unique and at least 8 characters.
 - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` control delivery.
+
+Automatic lookup runs once at worker startup and again after a worker restart. It uses
+the saved Instagram session, updates only the running process environment, and keeps
+history keyed by numeric ID. It does not write to `.env`. Lookup failures (including
+rate limits, expired sessions, or an unexpected account response) stop startup and
+are retried by the supervisor. `TARGET_RESOLVED` records a successful lookup.
+The Telegram-only test does not require an Instagram lookup.
 
 The default noVNC binding is `127.0.0.1:6080`. Keep it local whenever possible.
 
@@ -182,8 +189,8 @@ Stop all monitoring services with:
 
 | Variable | File | Required | Description |
 | --- | --- | --- | --- |
-| `IG_TARGET_USERNAME` | `.env` | Recommended | Human-readable account name used in messages |
-| `IG_TARGET_USER_ID` | `.env` | Yes | Numeric Instagram account ID |
+| `IG_TARGET_USERNAME` | `.env` | Yes, unless ID is supplied | Account username; used to resolve the numeric ID and in messages |
+| `IG_TARGET_USER_ID` | `.env` | No | Optional numeric ID override; resolved automatically when omitted |
 | `IG_CHECK_INTERVAL_SECONDS` | `.env` | No | Base polling interval; defaults to `300` |
 | `VNC_PASSWORD` | `.env` | For login | Password for the temporary noVNC session |
 | `NOVNC_BIND_ADDRESS` | `.env` | No | Host address for noVNC; defaults to `127.0.0.1` |

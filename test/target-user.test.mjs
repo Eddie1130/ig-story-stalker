@@ -95,3 +95,38 @@ test('a blocked read receipt prevents accepting the resolved ID', async () => {
   assert.equal(env.IG_TARGET_USER_ID, undefined);
   assert.equal(f.calls.closed, 1);
 });
+
+test('default logger works and browser exceptions do not expose private diagnostics', async () => {
+  const f = browserFixture();
+  assert.equal(await resolve({ IG_TARGET_USERNAME: 'example.user' }, undefined, f.chromium), '9007199254740993123');
+  const broken = browserFixture();
+  // Model a network failure within the browser callback.
+  const launch = broken.chromium.launchPersistentContext;
+  broken.chromium.launchPersistentContext = async (...args) => {
+    const context = await launch(...args);
+    context.pages()[0].evaluate = async () => { throw Error('https://private.example/?token=secret'); };
+    return context;
+  };
+  await assert.rejects(resolve({ IG_TARGET_USERNAME: 'example.user' }, undefined, broken.chromium), /^Error: TARGET_LOOKUP_BROWSER_OR_NETWORK_ERROR$/);
+  assert.equal(broken.calls.closed, 1);
+});
+
+
+test('browser launch and close failures use safe diagnostics and preserve lookup errors', async () => {
+  await assert.rejects(resolve({ IG_TARGET_USERNAME: 'example.user' }, undefined, {
+    launchPersistentContext: async () => { throw Error('private browser path'); },
+  }), /^Error: TARGET_BROWSER_START_ERROR$/);
+  for (const status of [200, 429]) {
+    const f = browserFixture({ status });
+    const launch = f.chromium.launchPersistentContext;
+    f.chromium.launchPersistentContext = async (...args) => {
+      const context = await launch(...args);
+      context.close = async () => { throw Error('private browser path'); };
+      return context;
+    };
+    const env = { IG_TARGET_USERNAME: 'example.user' };
+    await assert.rejects(resolve(env, undefined, f.chromium), status === 200
+      ? /^Error: TARGET_BROWSER_CLOSE_ERROR$/ : /^Error: TARGET_BOOTSTRAP_HTTP_429$/);
+    assert.equal(env.IG_TARGET_USER_ID, undefined);
+  }
+});

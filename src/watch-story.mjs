@@ -1,3 +1,4 @@
+import { ensureTargetUserId } from './target-user.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -70,7 +71,9 @@ export function fetchStories(script, onChild = () => {}, timeoutMs = 120000) {
 }
 
 async function main() {
-  const target = process.env.IG_TARGET_USER_ID || '';
+  const target = process.argv.includes('--test-telegram')
+    ? process.env.IG_TARGET_USER_ID || '0'
+    : await ensureTargetUserId(process.env, log);
   const username = process.env.IG_TARGET_USERNAME || target;
   const token = process.env.TELEGRAM_BOT_TOKEN || '';
   const chatId = process.env.TELEGRAM_CHAT_ID || '';
