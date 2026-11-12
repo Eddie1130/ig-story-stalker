@@ -6,22 +6,24 @@ const resolve = async (...args) => (await import('../src/target-user.mjs')).ensu
 
 function browserFixture({ status = 200, pathname = '/accounts/edit/', result, receipt = false } = {}) {
   const calls = { launches: 0, closed: 0, requests: [] };
-  let routeHandler;
+  let routeHandler, currentUrl;
   const page = {
-    goto: async () => ({ status: () => status }),
-    url: () => `https://www.instagram.com${pathname}`,
-    evaluate: async (fn, arg) => {
-      // Execute the actual browser callback with a controlled fetch boundary.
-      const original = globalThis.fetch;
-      globalThis.fetch = async (url, options) => {
-        calls.requests.push({ url, options });
-        if (receipt) await routeHandler({ request: () => ({ method: () => 'POST', url: () => 'https://www.instagram.com/graphql/query', postData: () => 'operationName=SeenMutation', resourceType: () => 'fetch' }), abort: async () => {}, continue: async () => {} });
-        return { status: result?.status ?? 200, json: async () => {
-          if (result?.invalidJson) throw Error('private response');
-          return result?.body ?? { status: 'ok', data: { user: { id: '9007199254740993123', username: 'Example.User' } } };
-        } };
-      };
-      try { return await fn(arg); } finally { globalThis.fetch = original; }
+    goto: async url => {
+      calls.requests.push({ url });
+      currentUrl = calls.requests.length === 1
+        ? `https://www.instagram.com${pathname}` : url;
+      if (receipt && calls.requests.length === 2) await routeHandler({ request: () => ({ method: () => 'POST', url: () => 'https://www.instagram.com/graphql/query', postData: () => 'operationName=SeenMutation', resourceType: () => 'fetch' }), abort: async () => {}, continue: async () => {} });
+      return { status: () => calls.requests.length === 1 ? status : result?.status ?? 200 };
+    },
+    url: () => currentUrl,
+    evaluate: async fn => {
+      const original = globalThis.document;
+      globalThis.document = { querySelectorAll: () => [{ textContent: result?.invalidJson ? 'invalid' : JSON.stringify(result?.body ?? {
+        require: [['ScheduledServerJS', 'handle', { __bbox: { result: { data: {
+          xig_user_by_username: { pk: '9007199254740993123', id: 'opaque-relay-id', username: 'Example.User' },
+        } } } }]],
+      }) }] };
+      try { return await fn(); } finally { globalThis.document = original; }
     },
   };
   const chromium = { launchPersistentContext: async () => {
@@ -36,9 +38,7 @@ test('username alone resolves an exact numeric ID and shares it with child fetch
   assert.equal(await resolve(env, () => {}, f.chromium), '9007199254740993123');
   assert.equal(env.IG_TARGET_USER_ID, '9007199254740993123');
   assert.equal(f.calls.closed, 1);
-  assert.equal(f.calls.requests[0].url, '/api/v1/users/web_profile_info/?username=Example.User');
-  assert.equal(f.calls.requests[0].options.credentials, 'include');
-  assert.equal(f.calls.requests[0].options.redirect, 'error');
+  assert.equal(f.calls.requests[1].url, 'https://www.instagram.com/Example.User/');
   await resolve(env, () => {}, f.chromium);
   assert.equal(f.calls.launches, 1);
 });
@@ -68,7 +68,7 @@ test('bootstrap HTTP and session errors close Chromium and leave ID unset', asyn
     await assert.rejects(resolve(env, () => {}, f.chromium), error);
     assert.equal(f.calls.closed, 1);
     assert.equal(env.IG_TARGET_USER_ID, undefined);
-    assert.equal(f.calls.requests.length, 0);
+    assert.equal(f.calls.requests.length, 1);
   }
 });
 
@@ -76,11 +76,11 @@ test('lookup errors, absent users, wrong accounts and unsafe numeric IDs fail cl
   for (const [result, error] of [
     [{ status: 404 }, /TARGET_LOOKUP_HTTP_404/],
     [{ status: 429 }, /TARGET_LOOKUP_HTTP_429/],
-    [{ invalidJson: true }, /TARGET_LOOKUP_INVALID_JSON/],
+    [{ invalidJson: true }, /TARGET_LOOKUP_INVALID_USER/],
     [{ body: { status: 'fail' } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { user: { id: '123', username: 'someone.else' } } } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { user: { id: 9007199254740992, username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { user: { id: 'bad', username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { id: '123', username: 'someone.else' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { id: 9007199254740992, username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { id: 'bad', username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
   ]) {
     const f = browserFixture({ result }), env = { IG_TARGET_USERNAME: 'example.user' };
     await assert.rejects(resolve(env, () => {}, f.chromium), error);
