@@ -115,7 +115,8 @@ Edit both files:
 - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` control delivery.
 
 Automatic lookup runs once at worker startup and again after a worker restart. It uses
-the saved Instagram session, updates only the running process environment, and keeps
+the saved Instagram session to read the target profile page and extract its numeric ID
+from embedded account or route data. It updates only the running process environment and keeps
 history keyed by numeric ID. It does not write to `.env`. Lookup failures (including
 rate limits, expired sessions, or an unexpected account response) stop startup and
 are retried by the supervisor. `TARGET_RESOLVED` records a successful lookup.

@@ -32,28 +32,20 @@ export async function ensureTargetUserId(env = process.env, log = () => {}, brow
     if (/^\/(?:accounts\/login|challenge|checkpoint)(?:\/|$)/i.test(pathname)) throw Error('TARGET_SESSION_INVALID');
     if (response?.status() !== 200) throw Error(`TARGET_BOOTSTRAP_HTTP_${response?.status() ?? 'ERROR'}`);
     if (pathname !== '/accounts/edit/') throw Error('TARGET_BOOTSTRAP_UNEXPECTED_REDIRECT');
-    const result = await page.evaluate(async username => {
-      const response = await fetch(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`, {
-        method: 'GET', credentials: 'include', redirect: 'error',
-        headers: { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest' },
-        signal: AbortSignal.timeout(30000),
-      });
-      if (response.status !== 200) return { status: response.status };
-      try { return { status: response.status, body: await response.json() }; }
-      catch { return { status: response.status, invalidJson: true }; }
-    }, username);
-    if (result.status !== 200) throw Error(`TARGET_LOOKUP_HTTP_${result.status}`);
-    if (result.invalidJson) throw Error('TARGET_LOOKUP_INVALID_JSON');
-    const user = result.body?.data?.user;
-    const userId = user?.id;
-    if ((result.body?.status && result.body.status !== 'ok') ||
-        typeof user?.username !== 'string' || user.username.toLowerCase() !== username.toLowerCase() ||
-        !['string', 'number'].includes(typeof userId) ||
-        (typeof userId === 'number' && !Number.isSafeInteger(userId)) || !/^[1-9]\d*$/.test(String(userId))) {
-      throw Error('TARGET_LOOKUP_INVALID_USER');
-    }
+    const profile = await page.goto(`https://www.instagram.com/${username}/`, {
+      waitUntil: 'domcontentloaded', timeout: 45000,
+    });
+    const profilePath = new URL(page.url()).pathname;
+    if (/^\/(?:accounts\/login|challenge|checkpoint)(?:\/|$)/i.test(profilePath)) throw Error('TARGET_SESSION_INVALID');
+    if (profile?.status() !== 200) throw Error(`TARGET_LOOKUP_HTTP_${profile?.status() ?? 'ERROR'}`);
+    if (profilePath.toLowerCase() !== `/${username.toLowerCase()}/`) throw Error('TARGET_LOOKUP_UNEXPECTED_REDIRECT');
+    // External scripts stay blocked. Parse embedded JSON without evaluating its contents.
+    const scripts = await page.evaluate(() => Array.from(
+      document.querySelectorAll('script[type="application/json"]'), script => script.textContent || '',
+    ));
+    const userId = profileUserId(scripts, username);
     if (guard.blockedReadReceipt) throw Error('TARGET_GUARD_INVARIANT_FAILED');
-    resolved = String(userId);
+    resolved = userId;
   } catch (error) {
     // Browser exceptions can contain response data; expose only stable diagnostics.
     failure = /^TARGET_[A-Z0-9_]+$/.test(error.message)
@@ -66,4 +58,36 @@ export async function ensureTargetUserId(env = process.env, log = () => {}, brow
   env.IG_TARGET_USER_ID = resolved;
   log('TARGET_RESOLVED', { username, targetUserId: resolved });
   return resolved;
+}
+
+// Instagram's Relay "id" may be opaque; the numeric account ID is "pk".
+export function profileUserId(scripts, username) {
+  const ids = new Set();
+  const addId = id => {
+    if ((typeof id === 'string' || (typeof id === 'number' && Number.isSafeInteger(id))) && /^[1-9]\d*$/.test(String(id))) {
+      ids.add(String(id));
+    }
+  };
+  const matches = name => typeof name === 'string' && name.toLowerCase() === username.toLowerCase();
+  const visit = value => {
+    if (!value || typeof value !== 'object') return;
+    const user = value.xig_user_by_username;
+    if (user && matches(user.username)) addId(user.pk);
+    // Logged-in pages embed profile identity in the initial route instead.
+    // Tie IDs to that route's username, never to arbitrary profile_id fields.
+    const route = value.initialRouteInfo?.route;
+    if (route && matches(route.params?.username)) {
+      for (const view of [route.rootView, route.hostableView]) {
+        addId(view?.props?.page_logging?.params?.profile_id);
+      }
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  for (const script of scripts) {
+    let data;
+    try { data = JSON.parse(script); } catch { continue; }
+    visit(data);
+  }
+  if (ids.size !== 1) throw Error('TARGET_LOOKUP_INVALID_USER');
+  return [...ids][0];
 }

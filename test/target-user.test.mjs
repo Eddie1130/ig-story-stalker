@@ -78,9 +78,9 @@ test('lookup errors, absent users, wrong accounts and unsafe numeric IDs fail cl
     [{ status: 429 }, /TARGET_LOOKUP_HTTP_429/],
     [{ invalidJson: true }, /TARGET_LOOKUP_INVALID_USER/],
     [{ body: { status: 'fail' } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { xig_user_by_username: { id: '123', username: 'someone.else' } } } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { xig_user_by_username: { id: 9007199254740992, username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
-    [{ body: { data: { xig_user_by_username: { id: 'bad', username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { pk: '123', username: 'someone.else' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { pk: 9007199254740992, username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
+    [{ body: { data: { xig_user_by_username: { pk: 'bad', username: 'example.user' } } } }, /TARGET_LOOKUP_INVALID_USER/],
   ]) {
     const f = browserFixture({ result }), env = { IG_TARGET_USERNAME: 'example.user' };
     await assert.rejects(resolve(env, () => {}, f.chromium), error);
@@ -128,5 +128,31 @@ test('browser launch and close failures use safe diagnostics and preserve lookup
     await assert.rejects(resolve(env, undefined, f.chromium), status === 200
       ? /^Error: TARGET_BROWSER_CLOSE_ERROR$/ : /^Error: TARGET_BOOTSTRAP_HTTP_429$/);
     assert.equal(env.IG_TARGET_USER_ID, undefined);
+  }
+});
+
+test('profile JSON uses pk, rejects ambiguity, and ignores unrelated embedded IDs', async () => {
+  const { profileUserId } = await import('../src/target-user.mjs');
+  const embedded = (pk, username = 'example.user') => JSON.stringify({
+    __bbox: { result: { data: { xig_user_by_username: { pk, username, id: 'opaque-id' } } } },
+  });
+  assert.equal(profileUserId(['not json', embedded('123'), embedded('123')], 'Example.User'), '123');
+  assert.equal(profileUserId([embedded('456', 'other'), embedded('123')], 'example.user'), '123');
+  for (const scripts of [[], [embedded('123', 'other')], [embedded('123'), embedded('456')], [embedded(9007199254740992)],
+    [JSON.stringify({ username: 'example.user', pk: '123', profile_id: '123' })]]) {
+    assert.throws(() => profileUserId(scripts, 'example.user'), /TARGET_LOOKUP_INVALID_USER/);
+  }
+});
+
+test('logged-in profile routes bind page_logging profile_id to the exact route username', async () => {
+  const { profileUserId } = await import('../src/target-user.mjs');
+  const route = (username, rootId, hostId = rootId) => JSON.stringify({ require: [{ initialRouteInfo: { route: {
+    params: { username },
+    rootView: { props: { page_logging: { params: { profile_id: rootId } } } },
+    hostableView: { props: { page_logging: { params: { profile_id: hostId } } } },
+  } } }] });
+  assert.equal(profileUserId([route('Example.User', '10086485421')], 'example.user'), '10086485421');
+  for (const scripts of [[route('other', '123')], [route('example.user', '123', '456')], [route('example.user', 'invalid')]]) {
+    assert.throws(() => profileUserId(scripts, 'example.user'), /TARGET_LOOKUP_INVALID_USER/);
   }
 });
