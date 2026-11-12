@@ -90,14 +90,20 @@ async function main() {
             (legacyId ? row.target === legacyId : legacyUsername && row.username === legacyUsername)) {
           issues.migrateAccount(row.username); legacyMigrated = true;
         }
+        if (row.event === 'MANUAL_WORK') {
+          if (!Number.isFinite(row.seconds) || row.seconds < 0 || row.seconds > 900) { issues.fail('worker-output', 'INVALID_MANUAL_DEADLINE'); return; }
+          health.phase = 'manual'; health.workerDeadline = Date.now() + row.seconds * 1000;
+        }
+        if (row.event === 'WATCH_TARGET_REMOVED') issues.suspendAccount(row.username, row.target);
+        if (row.event === 'WATCH_TARGET_READY') issues.migrateTarget(row.target, row.username);
         const globalKeys = new Set(['worker-exit', 'worker-fatal', 'worker-stall', 'worker-stderr', 'worker-output', 'shared-session']);
         const accountIssues = {
-          fail: (key, reason) => issues.fail(globalKeys.has(key) ? key : targetIssueKey(row, key), reason, row.username ? '@' + row.username : undefined),
+          fail: (key, reason) => issues.fail(globalKeys.has(key) ? key : targetIssueKey(row, key), reason, row.username ? '@' + row.username : undefined, { target: row.target, usernames: row.usernames }),
           resolve: key => issues.resolve(globalKeys.has(key) ? key : targetIssueKey(row, key)),
         };
         if (row.event === 'WATCH_TARGET_COMPLETED') accountIssues.resolve('target-runtime');
         if (row.event === 'SHARED_SESSION_RECOVERED') issues.resolve('shared-session');
-        if (['WATCH_TARGET_FAILED', 'WATCH_TARGET_COMPLETED', 'WATCH_TARGET_READY', 'WATCH_TARGET_STARTED', 'WATCH_TARGET_PAUSE', 'TARGET_RESOLVE_START', 'TARGET_RESOLVED', 'SHARED_SESSION_RECOVERED', 'SHARED_SESSION_INVALID'].includes(row.event)) {
+        if (['WATCH_TARGET_REMOVED', 'WATCH_TARGET_FAILED', 'WATCH_TARGET_COMPLETED', 'WATCH_TARGET_READY', 'WATCH_TARGET_STARTED', 'WATCH_TARGET_PAUSE', 'TARGET_RESOLVE_START', 'TARGET_RESOLVED', 'SHARED_SESSION_RECOVERED', 'SHARED_SESSION_INVALID'].includes(row.event)) {
           health.workerDeadline = Date.now() + 150000;
         }
         const problem = eventIssue(row); if (problem) accountIssues.fail(...problem);

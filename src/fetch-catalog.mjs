@@ -1,7 +1,14 @@
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 import { makeRequest, decodeResponse, normalizeResponse, installCatalogGuard } from './catalog-api.mjs';
-const log=(event,data={})=>console.log(JSON.stringify({ts:new Date().toISOString(),event,...data}));
+const log=(event,data={})=>{
+  const line=JSON.stringify({ts:new Date().toISOString(),event,...data});
+  console.log(line);
+  if(event==='CATALOG_OWNER_DIAGNOSTIC') {
+    try { fs.appendFileSync('/app/logs/catalog-diagnostics.log',line+'\n',{mode:0o600}); }
+    catch { console.log(JSON.stringify({ts:new Date().toISOString(),event:'CATALOG_DIAGNOSTIC_STORAGE_ERROR'})); }
+  }
+};
 let context, stage='CONFIG';
 try {
   log('CATALOG_REQUEST_VERSION',{version:'HIGHLIGHTS_GRAPHQL_V1'});
@@ -85,7 +92,22 @@ try {
     return {status:response.status,text:await response.text()};
   },{spec,tokens});
   stage='RESPONSE';
-  const normalized=normalizeResponse(decodeResponse(result),plan,config.target);
+  const decoded = decodeResponse(result);
+  let normalized;
+  try { normalized = normalizeResponse(decoded,plan,config.target); }
+  catch (error) {
+    if (error.message === 'CATALOG_OWNER_MISMATCH' && plan.kind === 'posts') {
+      const numeric = value => /^\d+$/.test(String(value || '')) ? String(value) : null;
+      log('CATALOG_OWNER_DIAGNOSTIC', { target: config.target, username: config.username,
+        paginated: !!plan.cursor, owners: (decoded.data?.xdt_api__v1__feed__user_timeline_graphql_connection?.edges || []).slice(0, 12).map(edge => { const p=edge?.node; return ({
+          post: numeric(p?.pk), owner: numeric(p?.user?.pk ?? p?.user?.id),
+          coauthors: (Array.isArray(p?.coauthor_producers) ? p.coauthor_producers : []).map(u => numeric(u?.pk ?? u?.id)).filter(Boolean),
+          invited: (Array.isArray(p?.invited_coauthor_producers) ? p.invited_coauthor_producers : []).map(u => numeric(u?.pk ?? u?.id)).filter(Boolean),
+          ownerKeys: Object.keys(p?.user || {}).filter(k => /^[a-z_]+$/.test(k)).slice(0, 25),
+        }); }) });
+    }
+    throw error;
+  }
   if(guard.blockedReadReceipt || guard.allowedQuery!==1) throw Error('CATALOG_GUARD_INVARIANT_FAILED');
   fs.writeFileSync(process.env.IG_CATALOG_RESULT_FILE,JSON.stringify({version:1,target:config.target,guard,...normalized}),{mode:0o600,flag:'wx'});
   log('CATALOG_FETCH_SUCCESS',{kind:plan.kind,itemCount:(normalized.highlights||normalized.media||normalized.posts||[]).length,guard});

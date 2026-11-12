@@ -23,7 +23,7 @@ export function archiveBase(story, target) {
   const stamp = d.toISOString().slice(0, 19);
   return path.join('stories', `${stamp.slice(0, 10).replaceAll('-', '')}_${stamp.slice(11).replaceAll(':', '')}_JST_${story.id}`);
 }
-function mediaExtension(bytes, type) {
+export function mediaExtension(bytes, type) {
   if (type === 2 && bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp') return '.mp4';
   if (type === 1) {
     if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return '.jpg';
@@ -138,7 +138,7 @@ export class StoryArchive {
     }
     this.persist();
   }
-  async run(signal, { limit = 5, budgetMs = 90000 } = {}) {
+  async run(signal, { limit = 5, budgetMs = 90000, shouldYield = () => false } = {}) {
     const started = Date.now();
     const probe = path.join(this.root, `.ig-write-test-${randomUUID()}`);
     try {
@@ -150,7 +150,7 @@ export class StoryArchive {
     let ok = true, count = 0;
     const pending = Object.values(this.state.pending).sort((a,b) => Number(!!a.failures) - Number(!!b.failures) || (a.lastAttemptAt || 0) - (b.lastAttemptAt || 0));
     for (const story of pending) {
-      if (signal?.aborted || count >= limit || Date.now() - started >= budgetMs) break;
+      if (signal?.aborted || shouldYield() || count >= limit || Date.now() - started >= budgetMs) break;
       if (Date.now() - story.detectedAt > 7 * 86400000) {
         this.state.failed[story.id] = { at: Date.now(), reason: story.error || 'NAS_RETRY_EXPIRED' };
         delete this.state.pending[story.id]; this.persist();

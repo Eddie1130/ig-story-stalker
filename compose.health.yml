@@ -19,12 +19,14 @@ services:
       - .env.telegram
     environment:
       TZ: Asia/Hong_Kong
+      IG_TELEGRAM_CONTROL: ${IG_TELEGRAM_CONTROL:-1}
       IG_TARGET_USERNAMES: ${IG_TARGET_USERNAMES:-}
       IG_TARGET_USERNAME: ${IG_TARGET_USERNAME:-}
       IG_TARGET_USER_ID: ${IG_TARGET_USER_ID:-}
     volumes:
       - ./src:/app/src:ro
       - ${IG_DATA_DIR:-./data}/watch:/app/state
+      - ${IG_DATA_DIR:-./data}/control:/app/control:ro
       - ${IG_DATA_DIR:-./data}/watchdog:/app/watchdog-state
     restart: unless-stopped
     stop_grace_period: 30s

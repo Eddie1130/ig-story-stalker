@@ -14,6 +14,7 @@ The project is designed for unattended Docker deployments. It includes a fail-cl
 - Manual Instagram login through a temporary noVNC container
 - Persistent Chromium session stored outside the image
 - Multiple target accounts with independent download folders, delivery history and retries
+- Private Telegram menus with whitelisted users, personal subscriptions and notification preferences
 - Headless Story checks with configurable intervals and exponential backoff
 - Direct Telegram delivery for supported Story photos and videos
 - Deduplication and durable retry state across restarts
@@ -57,16 +58,20 @@ Story archiving is independent of Telegram delivery, so currently available Stor
 can be archived even if already sent. Expired or deleted Stories cannot be recovered
 unless their media remains accessible. The dedicated Reels tab is not scanned.
 
-All accounts share the saved login, Telegram chat and polling settings. Checks run
-sequentially, with a two-second pause between accounts; a slow account can delay
-later accounts. Telegram media captions and account alerts identify the source.
-Each account has independent fetch backoff, archive queues, post numbering and
-baseline scans. A failed lookup, fetch, or damaged account history leaves other
-accounts running. Damaged histories are never replaced with empty state; account
-initialization/storage failures retry every five minutes and remain visible in health.
-A shared login/challenge failure pauses all accounts, emits an alert, and probes the
-login every five minutes before resuming. Telegram rate-limit waits apply to the
-shared destination across accounts.
+All accounts share the saved Instagram login and polling settings. Each approved
+Telegram user has their own private subscriptions and notification switches. A target
+followed by several users is fetched and archived once, while each user's delivery
+acknowledgements and retries remain independent. Disabling notifications never disables
+local archiving. Removing the last subscription stops future work for that target;
+an in-flight check/download may finish. Files and history remain on disk.
+
+Checks run sequentially, with a two-second pause between accounts; a slow account can
+delay later accounts. Each account has independent fetch backoff, archive queues,
+post numbering and baseline scans. A failed lookup, fetch, or damaged account history
+leaves other accounts running. Damaged histories are never replaced with empty state;
+account initialization/storage failures retry every five minutes and remain visible
+in health. A shared login/challenge failure pauses all accounts, emits an alert, and
+probes the login every five minutes before resuming.
 
 Stories use `IG_CHECK_INTERVAL_SECONDS` (default 300). Post scans and Highlight
 scans use `IG_POSTS_INTERVAL_SECONDS` and `IG_HIGHLIGHTS_INTERVAL_SECONDS` (default
@@ -147,7 +152,7 @@ chmod 600 .env .env.telegram
 
 Edit both files:
 
-- `IG_TARGET_USERNAMES=alice,bob,charlie` selects the accounts (usernames only, without `@`). Whitespace is trimmed and duplicate names are ignored, case-insensitively. Restart the watcher after editing the list.
+- `IG_TARGET_USERNAMES=alice,bob,charlie` supplies the initial owner subscriptions (usernames only, without `@`). Whitespace is trimmed and duplicate names are ignored, case-insensitively. Once Telegram settings are initialized, manage subscriptions through the menu; editing the environment does not overwrite saved choices.
 - A nonempty `IG_TARGET_USERNAMES` takes precedence over both legacy target variables. Each username is resolved separately; a stale `IG_TARGET_USER_ID` cannot override the list.
 - If the list is unset or empty, the original `IG_TARGET_USERNAME` and optional `IG_TARGET_USER_ID` still work. In legacy mode a numeric ID skips lookup.
 - `IG_CHECK_INTERVAL_SECONDS` must be between 60 and 86400.
@@ -159,7 +164,8 @@ the saved Instagram session to read the target profile page and extract its nume
 from embedded account or route data. It updates only the running process environment and keeps
 history keyed by numeric ID. It does not write to `.env`. Lookup failures (including rate limits or an unexpected account response) back off
 for that account while other targets continue. An expired shared session pauses all targets. `TARGET_RESOLVED` records a successful lookup.
-The Telegram-only test does not require an Instagram lookup.
+The Telegram-only test does not require an Instagram lookup. It uses the legacy
+`TELEGRAM_CHAT_ID` destination; normal controlled delivery uses each approved user's private chat.
 
 The default noVNC binding is `127.0.0.1:6080`. Keep it local whenever possible.
 
@@ -203,7 +209,7 @@ A valid session emits `SESSION_OK`. The guard test should emit `GUARD_SELFTEST_P
 ### 4. Test Telegram delivery
 
 ```sh
-./igctl build ig-watch ig-watchdog
+./igctl build ig-watch ig-watchdog ig-telegram
 ./igctl run --rm ig-watch node /app/src/watch-media.mjs --test-telegram
 ```
 
@@ -212,9 +218,9 @@ The test sends a text message only. It does not fetch or deliver a Story.
 ### 5. Start continuous monitoring
 
 ```sh
-./igctl up -d ig-watch ig-watchdog
+./igctl up -d ig-watch ig-watchdog ig-telegram
 ./igctl ps
-./igctl logs -f ig-watch ig-watchdog
+./igctl logs -f ig-watch ig-watchdog ig-telegram
 ```
 
 Stop all monitoring services with:
@@ -223,7 +229,164 @@ Stop all monitoring services with:
 ./igctl down
 ```
 
-`igctl` combines `docker-compose.yml`, `compose.watch.yml`, and `compose.health.yml`. The resulting deployment runs the media watcher under a supervisor and keeps the independent watchdog in a separate container.
+`igctl` combines `docker-compose.yml`, `compose.watch.yml`, and `compose.health.yml`. The resulting deployment runs the media watcher under a supervisor and keeps the independent watchdog and Telegram control service in separate containers.
+
+## Telegram private menus
+
+Send `/start` or `/menu` to your bot in a **private chat**. The command menu offers:
+
+- **監看帳號** / **新增帳號**: add a username such as `alice` or `@alice`, or confirm
+  removing a subscription. `/add alice` is also supported.
+- **媒體通知**: select an account and independently enable/disable Story, post and
+  Highlight notifications. All three are enabled by default; local downloads continue.
+- **每日摘要**: disabled by default. When enabled, receive one personal summary per
+  Hong Kong calendar day at 20:00. If the service starts after that time, today's
+  summary is queued then. Account errors and recovery alerts remain enabled.
+- **我的狀態** / `/status`: view only your subscriptions and relevant incidents.
+  `/cancel` exits an account-entry prompt.
+
+The owner is `TELEGRAM_OWNER_USER_ID`, or the positive private-user
+`TELEGRAM_CHAT_ID` when the owner variable is omitted. If the old destination is a
+group (negative chat ID), explicitly configure the owner's **numeric user ID**.
+Add other approved IDs to `TELEGRAM_ALLOWED_USER_IDS=123456789,987654321` in
+`.env.telegram`, then recreate **ig-telegram**. Each user must start the bot privately
+before it can send them messages. Group messages and callbacks, unknown users, and
+callbacks whose private chat does not match the sender are ignored. The owner is
+always approved. Revoked users retain saved history but stop receiving messages and
+stop contributing targets to the active watch list.
+
+On first startup, `ig-telegram` imports the environment's target list into the owner's
+settings and migrates acknowledged Story IDs. New users start with an empty list.
+It persists choices under `data/control/`; changes reach the worker at its next
+settings refresh (normally within five seconds when idle, or after the current cycle).
+The worker keeps its normal Instagram scan interval. Settings survive restarts and
+are never overwritten by the initial environment list. An empty subscription list
+is valid and leaves the worker idle.
+
+Adding an account sends its currently available Stories, subject to your switches.
+Existing posts/Highlights download quietly. Historical posts/Highlights first found
+after a new subscription are also kept quiet using their publication time. Turning
+a notification switch back on does not replay already observed or queued content
+from the disabled period; only subsequent discoveries are eligible. This uses first
+detection time: content not observed until after re-enabling is a new discovery,
+even when its publication time is earlier. New subscriptions separately suppress
+historical posts/Highlights using publication time. Media already
+acknowledged for one user is not resent if another user fails. Telegram can still
+produce a duplicate if its acknowledgement is lost after delivery.
+
+Account-specific alerts go to the users subscribed to that account. Shared login,
+storage-capacity and service failures go to all approved users. The watchdog routes
+alerts through the control service; if that service or its polling heartbeat fails,
+it sends a separate direct fallback warning. A blocked recipient does not prevent
+other users from receiving replies or fallback alerts.
+
+Only **one** `ig-telegram` instance may poll a given bot token. An existing webhook
+is reported as a configuration error, never deleted automatically. A Telegram 429
+cooldown is persisted and shared between normal menu/media requests. The independent
+watchdog fallback has its own persisted cooldown. The bot uses the official
+[Telegram Bot API](https://core.telegram.org/bots/api#getupdates).
+
+To enable this feature on an existing deployment:
+
+```sh
+./igctl up -d --build --force-recreate ig-watch ig-watchdog ig-telegram
+```
+
+Compose enables `IG_TELEGRAM_CONTROL=1` by default. Set it to `0` in `.env` and
+recreate the stack to use the legacy environment-driven, single-destination delivery;
+the control container then stays idle and does not poll or change saved settings.
+Switching to legacy mode does not synchronize menu subscriptions back to `.env`.
+
+`data/control/settings.json` and `delivery.json`, plus their `.required` markers,
+protect personal settings, update offsets and delivery history. Do not delete them
+to retry a notification. Delivery state and `data/watch/telegram-events/` may contain
+signed media URLs and user IDs. Include `data/control/` in private backups, and keep
+it out of Git/support attachments. Account archives retain their existing locations.
+
+## Download an Instagram link
+
+In the bot's private chat, paste a post, Reel, Story, Highlight or Instagram share
+link. `/download <link>` and the **連結下載** menu entry are also available. Each
+message accepts up to ten links; each link is an independent durable job. Invalid
+or unavailable links are reported without discarding other valid jobs. This uses
+the existing approved-user list and saved Instagram login. Content must be
+accessible to that login. No separate login or extra bot token is needed.
+
+- A post/Reel downloads the whole carousel, in its original order; `img_index` and
+  tracking parameters do not limit the selection.
+- A Story URL downloads exactly the specified Story. An expired/deleted Story can
+  be returned from a complete manual cache, but cannot otherwise be recovered.
+- A Highlight URL downloads the whole accessible collection. Collection membership
+  is refreshed on each request, while complete media files are reused.
+- An account homepage prompts **加入 @account / 取消**. Only confirmation adds it to
+  that user's existing subscriptions; a homepage never triggers a bulk archive.
+- Repeating a link requests delivery again. Complete post/Story files are reused
+  after checking their size and signature; requests have independent delivery receipts.
+- Manual results bypass automatic Story/post/Highlight notification switches.
+  They do not automatically subscribe the requester to the source account.
+
+The worker finishes its current read/download, then gives queued manual jobs
+priority at the next safe boundary. Manual and background Instagram operations use
+one serialized browser profile. Menus and Telegram polling continue in a separate
+service. Background scans resume after due manual jobs, without losing their
+pagination or download checkpoints.
+
+Downloads choose the highest available resolution/bitrate. When a higher-quality
+DASH version has separate audio/video tracks, FFmpeg combines them with `-c copy`,
+without re-encoding. The worker image includes FFmpeg. Original media and captions
+are retained permanently under:
+
+```text
+downloads/manual/<username>/<post|story|highlight>/<content-id>/
+  001_<media-id>.jpg
+  002_<media-id>.mp4
+  manifest.json
+```
+
+Reels use the `post` directory. The complete manifest includes the source URL,
+caption and ordered file records. Partial-job metadata remains in `data/watch/manual/`.
+There is no automatic deletion of these downloaded files. Each source stream has a
+2,000,000,000-byte download ceiling, a five-minute transfer timeout, and up to three
+job attempts; larger/unavailable sources are reported. DASH source tracks and the
+merged file can coexist temporarily, so allow space for both.
+
+Telegram results are uploaded from local files, rather than asking Telegram to
+fetch Instagram's expiring CDN URLs. Photos/videos form albums of at most ten items,
+in order; a single item is sent normally. Oversized photos or rejected display
+formats can be sent as original documents, in separate document groups when needed.
+Before uploading, the controller probes the final local MP4 with ffprobe and supplies
+display width, height and duration to Telegram, accounting for rotation and pixel
+aspect ratio. It also extracts an upright JPEG preview (at most 320 pixels per
+side, preserving the display ratio) and uploads it as both thumbnail and cover
+for single videos and albums. This also applies to cached videos without
+re-encoding the original. If probing or preview extraction fails, the original
+group is sent as documents to preserve order and receipt boundaries. The
+controller image includes ffprobe and FFmpeg.
+The current cloud API file ceiling is 50 MB. Files above that ceiling stay local;
+other transferable media are sent and the bot reports **檔案過大，已下載但無法直接傳送**.
+This feature does not start a Local Bot API server or an external download website.
+
+Temporary fetch/download failures retry while complete files remain available for
+reuse. After retries, successfully downloaded items are still sent with a partial
+failure report. Telegram group acknowledgements are persisted individually. A
+network timeout or a restart during an in-flight upload is treated as uncertain:
+files stay local and the bot asks the user to check their chat; it does not blindly
+upload that group again. Reposting the link creates a new explicit request.
+Confirmed rate-limit rejections can retry after the shared Telegram cooldown.
+
+Settings/update offsets and manual requests are saved together in
+`data/control/settings.json`. The watcher owns `data/watch/manual/jobs/` and its
+cache index; the controller owns `data/control/manual-delivery.json` and its
+`.required` marker. Keep all of these in private backups. Do not delete receipt
+state to retry an upload. The controller's `/downloads` mount is read-only, and
+only the watcher writes media. No Instagram seen/read mutation is allowed.
+
+After upgrading, recreate the services so that FFmpeg and the read-only download
+mount are present:
+
+```sh
+./igctl up -d --build --force-recreate ig-watch ig-telegram ig-watchdog
+```
 
 ## Configuration
 
@@ -239,7 +402,10 @@ Stop all monitoring services with:
 | `IG_DATA_DIR` | `.env` | No | Host runtime-data directory; defaults to `./data` |
 | `IG_LOG_DIR` | `.env` | No | Host log directory; defaults to `./logs` |
 | `TELEGRAM_BOT_TOKEN` | `.env.telegram` | Yes | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | `.env.telegram` | Yes | Telegram destination chat ID |
+| `TELEGRAM_CHAT_ID` | `.env.telegram` | Yes | Legacy/test destination; also the default owner ID when positive |
+| `TELEGRAM_OWNER_USER_ID` | `.env.telegram` | For group migrations | Owner numeric user ID; defaults to a positive `TELEGRAM_CHAT_ID` |
+| `TELEGRAM_ALLOWED_USER_IDS` | `.env.telegram` | No | Additional approved private users, comma-separated; recreate ig-telegram after changes |
+| `IG_TELEGRAM_CONTROL` | `.env` | No | Compose defaults to `1`; `0` retains legacy delivery |
 
 ## Useful commands
 
@@ -275,6 +441,7 @@ The following paths contain private or machine-specific data and are excluded fr
 - `data/profile/` — Instagram cookies, local storage, history, and browser databases
 - `data/watch/` — delivery history, pending media, health, and supervisor state
 - `data/watchdog/` — watchdog issues, alert outbox, and delivery state
+- `data/control/` — personal Telegram settings, update offsets, notification queues and API cooldowns
 - `logs/` — local JSON audit and GUI service logs
 - `.env` and `.env.telegram` — local configuration and credentials
 
@@ -289,7 +456,9 @@ Instagram session profile
   watch-supervisor
           |
           v
-    watch-media  -----> Telegram photos/videos
+    watch-media  -----> durable events -----> telegram-control -----> private Telegram
+          |                                     |
+          |                                  personal menus
           |
           +-----> durable state + health files
                          |
@@ -297,7 +466,8 @@ Instagram session profile
                       watchdog -----> Telegram alerts
 ```
 
-The browser worker bootstraps an authenticated Instagram page and performs one allow-listed Story GraphQL query per configured numeric account ID, sequentially. The network guard blocks known seen/read operations and rejects other Instagram write requests. Story media URLs are passed through a private temporary file, delivered to Telegram, and never written to the audit log.
+The browser worker bootstraps an authenticated Instagram page and performs one allow-listed Story GraphQL query per configured numeric account ID, sequentially. Profile post scans accept an original producer or an explicitly confirmed coauthor;
+invited collaborators and unrelated accounts are rejected. The network guard blocks known seen/read operations and rejects other Instagram write requests. Story media URLs are passed through a private temporary file, delivered to Telegram, and never written to the audit log.
 
 ## Troubleshooting
 

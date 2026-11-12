@@ -32,7 +32,7 @@ export async function fetchCatalog(plan,{signal,onChild=()=>{},script='/app/src/
       const kill=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
       const timer=setTimeout(()=>{reason='CATALOG_FETCH_TIMEOUT';kill();},115000);
       signal?.addEventListener('abort',kill,{once:true});if(signal?.aborted)kill();
-      readline.createInterface({input:child.stdout}).on('line',line=>{try{const r=JSON.parse(line);if(r.event==='CATALOG_HTTP_DIAGNOSTIC'&&['tray','highlight'].includes(r.kind)&&Number.isInteger(r.status)&&['www.instagram.com','i.instagram.com'].includes(r.host))console.log(JSON.stringify({ts:new Date().toISOString(),event:r.event,target:env.IG_TARGET_USER_ID,username:env.IG_TARGET_USERNAME,kind:r.kind,transport:'context_request',status:r.status,host:r.host,redirects:r.redirects}));if(r.event==='CATALOG_FETCH_SUCCESS')success=true;if(r.event==='CATALOG_FETCH_ERROR'&&/^CATALOG_[A-Z0-9_]+$/.test(r.reason))reason=r.reason;}catch{}});
+      readline.createInterface({input:child.stdout}).on('line',line=>{try{const r=JSON.parse(line);if(r.event==='CATALOG_HTTP_DIAGNOSTIC'&&['tray','highlight'].includes(r.kind)&&Number.isInteger(r.status)&&['www.instagram.com','i.instagram.com'].includes(r.host))console.log(JSON.stringify({ts:new Date().toISOString(),event:r.event,target:env.IG_TARGET_USER_ID,username:env.IG_TARGET_USERNAME,kind:r.kind,transport:'context_request',status:r.status,host:r.host,redirects:r.redirects}));if(r.event==='CATALOG_OWNER_DIAGNOSTIC')console.log(JSON.stringify({ts:new Date().toISOString(),event:r.event,target:env.IG_TARGET_USER_ID,username:env.IG_TARGET_USERNAME,paginated:r.paginated,owners:r.owners}));if(r.event==='CATALOG_FETCH_SUCCESS')success=true;if(r.event==='CATALOG_FETCH_ERROR'&&/^CATALOG_[A-Z0-9_]+$/.test(r.reason))reason=r.reason;}catch{}});
       child.stderr.resume();
       child.on('error',()=>{reason='CATALOG_PROCESS_START_ERROR';});
       child.on('close',code=>{clearTimeout(timer);signal?.removeEventListener('abort',kill);onChild(null);if(code===0&&success&&!signal?.aborted)resolve();else reject(Error(reason));});
@@ -112,8 +112,9 @@ export class CatalogWatcher {
       else highlights.nextAt=0;
     }
   }
-  async check(signal,onChild) {
+  async check(signal,onChild,{shouldYield=()=>false}={}) {
     for(const group of ['posts','highlights']) {
+      if(shouldYield())break;
       const state=this.state[group];if(signal.aborted||Date.now()<state.nextAt)continue;
       const refreshFailedTray = group === 'highlights' && state.todo.length > 0 && state.todo.every(h => h.failures > 0) && Date.now() - (state.lastTrayAt || 0) >= this.highlightsInterval * 1000;
       const due = group === 'highlights' ? state.todo.find(h => !h.retryAt || Date.now() >= h.retryAt) : null;
@@ -140,13 +141,13 @@ export class CatalogWatcher {
       this.persist();this.log('CATALOG_CHECK_OK',{group,scope,kind:plan.kind,baselineComplete:this.state[group].baseline});
     }
   }
-  async deliver(signal,sendTelegram) {
+  async deliver(signal,sendTelegram,{shouldYield=()=>false}={}) {
     const started=Date.now();let ok=true,downloads=0,sends=0,tgBlocked=false;
     try { if (!(await fsp.stat(this.root)).isDirectory()) throw Error('CATALOG_ROOT_NOT_DIRECTORY'); }
     catch(e) { this.log('CATALOG_STORAGE_ERROR',{reason:safeReason(e)}); return false; }
     this.log('CATALOG_STORAGE_OK');
     for(const [id,caption] of Object.entries(this.state.captions).filter(([,c])=>c.savedHash!==c.hash).sort(([,a],[,b])=>(a.lastAttemptAt||0)-(b.lastAttemptAt||0)).slice(0,10)) {
-      if(signal.aborted)break;
+      if(signal.aborted||shouldYield())break;
       caption.lastAttemptAt=Date.now();
       try {
         const file=this.full(caption.file);await fsp.mkdir(path.dirname(file),{recursive:true});
@@ -158,13 +159,13 @@ export class CatalogWatcher {
     }
     const pending=Object.values(this.state.assets).filter(a=>!a.archiveDone||!a.telegramDone).sort((a,b)=>(a.lastAttemptAt||0)-(b.lastAttemptAt||0));
     for(const asset of pending) {
-      if(signal.aborted||Date.now()-started>=90000)break;
+      if(signal.aborted||shouldYield()||Date.now()-started>=90000)break;
       if ((asset.archiveDone || downloads >= 5) && (asset.telegramDone || tgBlocked || sends >= 5)) continue;
       if(!asset.archiveDone && downloads<5){
         downloads++;this.log('CATALOG_MEDIA_STARTED',{key:asset.key});
         let saved;
         try{saved=await this.downloader(this.root,asset.base,asset,{signal,timeoutMs:Math.min(45000,Math.max(1000,90000-(Date.now()-started)))});}
-        catch(e){if(signal.aborted)break;ok=false;asset.lastAttemptAt=Date.now();this.log('CATALOG_ARCHIVE_RETRY',{key:asset.key,reason:archiveReason(e)});}
+        catch(e){if(signal.aborted||shouldYield())break;ok=false;asset.lastAttemptAt=Date.now();this.log('CATALOG_ARCHIVE_RETRY',{key:asset.key,reason:archiveReason(e)});}
         if(saved){asset.archiveDone=true;asset.relativePath=saved.relativePath;asset.bytes=saved.bytes;this.persist();this.log('CATALOG_MEDIA_SAVED',{key:asset.key,path:saved.relativePath,bytes:saved.bytes});}
       }
       if(!asset.telegramDone&&!tgBlocked&&sends<5&&!signal.aborted){
@@ -175,7 +176,7 @@ export class CatalogWatcher {
         const body={caption:[...caption].slice(0,900).join('')};
         if(asset.mediaType===2){body.video=asset.mediaUrl;body.supports_streaming=true;}else body.photo=asset.mediaUrl;
         let sent=false;
-        try{await sendTelegram(asset.mediaType===2?'sendVideo':'sendPhoto',body);sent=true;}
+        try{await sendTelegram(asset.mediaType===2?'sendVideo':'sendPhoto',body,{id:asset.key,kind:asset.kind==='post'?'post':'highlight',detectedAt:asset.detectedAt,publishedAt:asset.takenAt*1000});sent=true;}
         catch(e){if(!e.message?.startsWith('TELEGRAM_'))throw e;ok=false;asset.lastAttemptAt=Date.now();const reason=/^TELEGRAM_[A-Z0-9_]+$/.test(e.message)?e.message:'CATALOG_TELEGRAM_ERROR';this.log('CATALOG_TELEGRAM_RETRY',{key:asset.key,reason});if(/_(401|403|429)$/.test(reason)||reason==='TELEGRAM_RETRY_WAIT')tgBlocked=true;}
         if(sent){asset.telegramDone=true;this.persist();this.log('CATALOG_TELEGRAM_SENT',{key:asset.key});}
       }

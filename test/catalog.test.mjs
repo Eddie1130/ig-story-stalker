@@ -95,3 +95,17 @@ test('failed captions rotate so later captions can still be saved', async t => {
  assert.equal(fs.readFileSync(path.join(f.media,'highlight/later/caption.txt'),'utf8'),'later');
  assert.equal(restarted.state.captions['10'].savedHash,'later');
 });
+
+test('profile pagination accepts confirmed coauthors but rejects invitations and unrelated owners', () => {
+ const collaboration=post();collaboration.user={pk:'77247833372'};collaboration.coauthor_producers=[{id:'99'}];
+ const plan={kind:'posts',cursor:'page-two'};
+ assert.equal(normalizeResponse(body([collaboration]),plan,'99').posts.length,1);
+ collaboration.coauthor_producers=[{pk:'99'}];
+ assert.equal(normalizeResponse(body([collaboration]),plan,'99').posts.length,1);
+ collaboration.coauthor_producers=[{id:'123'}];collaboration.invited_coauthor_producers=[{id:'99'}];
+ assert.throws(()=>normalizeResponse(body([collaboration]),plan,'99'),/OWNER_MISMATCH/);
+ delete collaboration.user;collaboration.coauthor_producers=[{id:'99'}];
+ assert.throws(()=>normalizeResponse(body([collaboration]),plan,'99'),/OWNER_MISMATCH/);
+ const tray={data:{highlights:{edges:[{node:{id:'highlight:77',title:'x',user:{pk:'123'},coauthor_producers:[{id:'99'}]}}],page_info:{has_next_page:false,has_previous_page:false}}}};
+ assert.throws(()=>normalizeResponse(tray,{kind:'tray'},'99'),/OWNER_MISMATCH/);
+});

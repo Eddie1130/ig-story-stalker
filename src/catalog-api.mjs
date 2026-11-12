@@ -57,10 +57,15 @@ function media(item, fallbackTime) {
   if (!validMediaUrl(best.url)) throw Error('CATALOG_UNEXPECTED_CDN_URL');
   return {id,mediaType:type,mediaUrl:best.url,takenAt:ts};
 }
-function owner(item,target,required=true) {
+function owner(item,target,{coauthors=false}={}) {
   const user=item?.user;
   const id=String(user?.pk ?? user?.id ?? '');
-  if ((required && !id) || (id && id!==target)) throw Error('CATALOG_OWNER_MISMATCH');
+  if (id===target) return;
+  // Profile timelines include accepted collaboration posts owned by the other
+  // producer. An invitation alone is not proof that the target owns the post.
+  if (/^\d+$/.test(id) && coauthors && Array.isArray(item?.coauthor_producers) &&
+      item.coauthor_producers.some(u=>String(u?.pk ?? u?.id ?? '')===target)) return;
+  throw Error('CATALOG_OWNER_MISMATCH');
 }
 function unique(items) {if(new Set(items.map(x=>x.id)).size!==items.length) throw Error('CATALOG_DUPLICATE_IDS');return items;}
 export function normalizeResponse(body,plan,target) {
@@ -68,7 +73,7 @@ export function normalizeResponse(body,plan,target) {
     const conn=body.data?.xdt_api__v1__feed__user_timeline_graphql_connection;
     if(!Array.isArray(conn?.edges) || typeof conn.page_info?.has_next_page!=='boolean') throw Error('CATALOG_POSTS_SCHEMA_ERROR');
     const posts=unique(conn.edges.map(edge=>{
-      const p=edge?.node;owner(p,target);
+      const p=edge?.node;owner(p,target,{coauthors:true});
       const id=String(p?.pk ?? p?.id ?? ''),takenAt=Number(p?.taken_at),type=Number(p?.media_type);
       if(!idOK(id)||!Number.isFinite(takenAt)||takenAt<=0||![1,2,8].includes(type)) throw Error('CATALOG_POST_SCHEMA_ERROR');
       const children=type===8?p.carousel_media:[p];

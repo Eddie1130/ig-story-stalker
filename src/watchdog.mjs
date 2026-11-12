@@ -1,9 +1,13 @@
+import { sendControlFallback } from './telegram-fallback.mjs';
+import { controlEnabled, readSettings, settingsFile } from './telegram-settings.mjs';
+import { publishEvent, eventDirectory, controlHeartbeat } from './telegram-events.mjs';
 import { formatJST } from './time-jst.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomic, load, queue, Issues, staleReason, safe, log } from './error-monitor.mjs';
 
 const shared = process.env.IG_MONITOR_DIR || '/app/state/monitor';
+const managed = controlEnabled(process.env);
 const own = process.env.IG_WATCHDOG_DIR || '/app/watchdog-state';
 const target = process.env.IG_TARGET_USERNAMES?.split(',').map(s => s.trim()).filter(Boolean).join(', @') || process.env.IG_TARGET_USERNAME || process.env.IG_TARGET_USER_ID || 'unknown';
 if (process.argv.includes('--self-test')) {
@@ -38,9 +42,26 @@ async function main() {
       if (reason && Date.now() - started > 120000) issues.fail('supervisor', reason);
       else if (!reason) issues.resolve('supervisor');
     } catch { issues.fail('supervisor', 'HEARTBEAT_READ_OR_PARSE_FAILED'); }
-    if ((!staleReason(sharedHealth) || Date.now() - started > 120000) && Date.now() - (state.lastSummaryAt || 0) >= 86400000) {
+    if (!managed && (!staleReason(sharedHealth) || Date.now() - started > 120000) && Date.now() - (state.lastSummaryAt || 0) >= 86400000) {
       queue(ownOutbox, 'status', `IG watchdog 運行狀態：@${target}\n主程式：${staleReason(sharedHealth) || 'HEARTBEAT_OK'}\n最近成功檢查：${sharedHealth?.lastCheckAt ? formatJST(sharedHealth.lastCheckAt) : '尚未記錄'}\n主程式未解除異常：${sharedHealth?.activeIssues ?? '未知'}\nwatchdog 未解除異常：${issues.activeCount()}\n此訊息每日一次。`);
       state.lastSummaryAt = Date.now(); persist();
+    }
+    if (managed) {
+      const controller = controlHeartbeat(process.env);
+      status.telegramOk = controller?.telegramOk === true;
+      if (controller) {
+        issues.resolve('telegram-control');
+        if (state.controlFallbackSent) { delete state.controlFallbackSent; persist(); }
+      } else if (Date.now() - started > 120000) {
+        issues.fail('telegram-control', 'CONTROL_HEARTBEAT_STALE');
+        // The command service also delivers notifications. An independent direct
+        // fallback must remain available when that service itself has stopped.
+        state.controlFallbackSent ||= {};
+        let recipients;
+        try { recipients = readSettings(settingsFile(process.env)).allowedIds; }
+        catch { recipients = [process.env.TELEGRAM_OWNER_USER_ID || chatId].filter(id => /^[1-9]\d*$/.test(id)); }
+        await sendControlFallback({ recipients, state, token, signal: abort.signal, persist, log });
+      }
     }
     // Oldest queued alerts first, including incidents resolved while Telegram was down.
     const pending = [];
@@ -67,6 +88,20 @@ async function main() {
         continue;
       }
       attempts++;
+      if (managed) {
+        // Historical daily summaries are superseded by individual preferences.
+        if (alert.kind !== 'status') {
+          const oldKey = /\n(target:([a-z0-9_.]+):[^\n]+)\n/.exec(alert.text);
+          const issueKey = alert.issueKey || oldKey?.[1];
+          const username = alert.username || oldKey?.[2];
+          publishEvent(eventDirectory(process.env), { ...alert, version: 1, type: 'alert',
+            at: Number.isFinite(alert.at) ? alert.at : Date.now(), issueKey, username,
+            usernames: alert.usernames?.length ? alert.usernames : alert.target ? (load(path.join('/app/state', 'health.json'), {})?.targets || []).filter(t => t.target === alert.target).map(t => t.username) : undefined }, 'alert:' + alert.id);
+        }
+        fs.unlinkSync(file);
+        log('WATCHDOG_ALERT_ROUTED', { kind: safe(alert.kind), id: safe(alert.id) });
+        continue;
+      }
       try {
         const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST', signal: AbortSignal.any([abort.signal, AbortSignal.timeout(20000)]),

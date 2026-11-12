@@ -30,16 +30,16 @@ export class Issues {
     if (!this.state || Array.isArray(this.state) || typeof this.state !== 'object') throw Error('INVALID_ISSUES_STATE');
     for (const entry of Object.values(this.state)) if (!entry || typeof entry.active !== 'boolean') throw Error('INVALID_ISSUE_ENTRY');
   }
-  fail(key, reason, label = this.target) {
+  fail(key, reason, label = this.target, scope = {}) {
     const old = this.state[key];
-    if (!old?.active || old.reason !== safe(reason)) queue(this.outbox, 'error', `IG 監控異常：${label}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`);
-    this.state[key] = { active: true, label, reason: safe(reason), firstAt: old?.active ? old.firstAt : Date.now(), lastAt: Date.now(), count: (old?.count || 0) + 1 };
+    if (!old?.active || old.reason !== safe(reason)) queue(this.outbox, 'error', `IG 監控異常：${label}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`, { issueKey: key, reason: safe(reason), username: /^target:([^:]+):/.exec(key)?.[1], target: /^\d+$/.test(scope.target || '') ? scope.target : undefined, usernames: scope.usernames });
+    this.state[key] = { active: true, label, target: scope.target, usernames: scope.usernames, reason: safe(reason), firstAt: old?.active ? old.firstAt : Date.now(), lastAt: Date.now(), count: (old?.count || 0) + 1 };
     atomic(this.file, this.state);
   }
   resolve(key) {
     const old = this.state[key];
     if (!old?.active) return;
-    queue(this.outbox, 'recovery', `IG 監控異常已解除：${old.label || this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`);
+    queue(this.outbox, 'recovery', `IG 監控異常已解除：${old.label || this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`, { issueKey: key, reason: old.reason, username: /^target:([^:]+):/.exec(key)?.[1], target: old.target, usernames: old.usernames });
     this.state[key] = { ...old, active: false, resolvedAt: Date.now() };
     atomic(this.file, this.state);
   }
@@ -51,6 +51,26 @@ export class Issues {
       if (!accountKey.test(key)) continue;
       const scoped = `target:${username}:${key}`;
       if (!this.state[scoped]) this.state[scoped] = { ...issue, label: '@' + username };
+      delete this.state[key]; changed = true;
+    }
+    if (changed) atomic(this.file, this.state);
+  }
+  suspendAccount(username, target) {
+    let changed = false;
+    for (const [key, issue] of Object.entries(this.state)) {
+      if (issue.active && key.startsWith('target:') && (key.startsWith(`target:${username}:`) || (target && issue.target === target))) {
+        this.state[key] = { ...issue, active: false, suspended: true, resolvedAt: Date.now() }; changed = true;
+      }
+    }
+    if (changed) atomic(this.file, this.state);
+  }
+  migrateTarget(target, username) {
+    let changed = false;
+    for (const [key, issue] of Object.entries(this.state)) {
+      const match = /^target:([^:]+):(.*)$/.exec(key);
+      if (!match || issue.target !== target || match[1] === username) continue;
+      const next = `target:${username}:${match[2]}`;
+      if (!this.state[next] || (!this.state[next].active && issue.active)) this.state[next] = { ...issue, label: '@' + username };
       delete this.state[key]; changed = true;
     }
     if (changed) atomic(this.file, this.state);
