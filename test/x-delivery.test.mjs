@@ -239,3 +239,27 @@ test('X authorization is rechecked after Telegram rate waiting before the actual
   f.client.call=async(method,body,options)=>{f.settings.allowedIds=[];options.beforeRequest?.();f.calls.push({method,body});return{message_id:1};};
   await f.delivery().drain(f.client);assert.equal(f.calls.length,0);
 });
+
+test('manual X events upload from the new manual directory with existing receipts intact', async t => {
+  const f=fixture(t);f.event.manual=true;f.event.userId='1';f.event.requestId='1-10-0';f.event.recipients=f.event.recipients.slice(0,1);
+  f.settings.xRequests['1-10-0']={id:'1-10-0',type:'manual',userId:'1',username:'alice',url:f.event.result.url};
+  const image=Buffer.from([255,216,255,...Array(13).fill(0)]);
+  fs.mkdirSync(path.join(f.root,'x/manual/alice/media'),{recursive:true});fs.writeFileSync(path.join(f.root,'x/manual/alice/media/123_01.jpg'),image);
+  f.event.result.files=[{relativePath:'x/manual/alice/media/123_01.jpg',bytes:16,mediaType:1}];f.publish();
+  await f.delivery().drain(f.client);await f.delivery().drain(f.client);
+  assert.deepEqual(f.calls.map(c=>c.method),['sendPhoto']);assert.match(f.calls[0].body.caption,/hello/);
+});
+
+test('automatic X events cannot read a manual directory or another account directory', async t => {
+  for (const relativePath of ['x/manual/alice/media/123_01.jpg','x/manual/bob/media/123_01.jpg','x/bob/media/123_01.jpg']) {
+    const f=fixture(t);f.event.result.files=[{relativePath,bytes:16,mediaType:1}];f.publish();
+    await assert.rejects(f.delivery().drain(f.client),/X_EVENT_INVALID/);
+  }
+});
+
+test('oversized manual results report the manual archive location', async t => {
+  const f=fixture(t);f.event.manual=true;f.event.userId='1';f.event.requestId='1-10-0';f.event.recipients=f.event.recipients.slice(0,1);
+  f.settings.xRequests['1-10-0']={id:'1-10-0',type:'manual',userId:'1',username:'alice',url:f.event.result.url};
+  f.event.result.files=[{relativePath:'x/manual/alice/media/123_01.jpg',bytes:50_000_001,mediaType:1}];f.publish();
+  await f.delivery().drain(f.client);assert.ok(f.calls.some(c=>c.body.text?.includes('downloads/x/manual/alice/')));
+});

@@ -96,7 +96,7 @@ export class ManualDelivery {
       else if (plan.oversized.length || result.errors?.length) text = [
         plan.oversized.length ? `${plan.oversized.length} 個檔案過大，已下載但無法直接傳送。` : '',
         result.errors?.length ? `${result.errors.length} 個媒體未能下載；其他可取得內容已回傳。\n${[...new Set(result.errors.map(e => manualFailureText(e.reason)))].slice(0,3).join('；')}` : '',
-        `本機位置：downloads/manual/${result.username}/${result.kind}/${result.contentId}/`, request.url,
+        `本機位置：downloads/instagram/manual/${result.username}/${result.kind}/${result.contentId}/`, request.url,
       ].filter(Boolean).join('\n');
       if (text) {
         try { await client.call('sendMessage', { chat_id: request.userId, text, link_preview_options: { is_disabled: true } }); }

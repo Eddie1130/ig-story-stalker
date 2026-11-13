@@ -168,3 +168,111 @@ test('mixed photo/video history reuses interleaved daily media without identity 
   const ordered = normalizeHistory({ id: '123', username: 'alice', media: {}, raw_twscrape: { media: { all: rows } } }, 'alice');
   assert.deepEqual(ordered.media.map(m => m.index), [1, 1001, 2]);
 });
+
+test('manual X downloads have their own paths and reuse automatic media without moving it', async t => {
+  const root = fixture(t); let calls = 0;
+  const archive = new XArchive({ root, fetchImpl: async () => { calls++; return new Response(jpeg); } });
+  const row = event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]);
+  const automatic = await archive.save(row), original = fs.readFileSync(path.join(root, 'x/alice/posts/123.json'));
+  const manual = await archive.save(row, { manual: true });
+  assert.equal(manual.files[0].relativePath, 'x/manual/alice/media/123_01.jpg');
+  assert.equal(calls, 1); assert.equal(xFile(root, manual.files[0]), path.join(root, manual.files[0].relativePath));
+  assert.deepEqual(fs.readFileSync(path.join(root, automatic.files[0].relativePath)), jpeg);
+  assert.deepEqual(fs.readFileSync(path.join(root, 'x/alice/posts/123.json')), original);
+  assert.ok(fs.existsSync(path.join(root, 'x/manual/alice/posts/123.json')));
+  assert.ok(fs.existsSync(path.join(root, 'x/manual/alice/posts/123.txt')));
+});
+
+test('automatic and historical X media can reuse a prior manual file', async t => {
+  const root = fixture(t); let calls = 0;
+  const archive = new XArchive({ root, fetchImpl: async () => { calls++; return new Response(jpeg); } });
+  const row = event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]);
+  const manual = await archive.save(row, { manual: true });
+  const automatic = await archive.save(row);
+  assert.equal(manual.files[0].relativePath, 'x/manual/alice/media/123_01.jpg');
+  assert.equal(automatic.files[0].relativePath, 'x/alice/media/123_01.jpg'); assert.equal(calls, 1);
+});
+
+test('manual media paths reject symlinks and preserve an existing conflicting file', async t => {
+  const root = fixture(t), outside = fixture(t);
+  fs.mkdirSync(path.join(root, 'x/manual'), { recursive: true }); fs.symlinkSync(outside, path.join(root, 'x/manual/alice'));
+  const archive = new XArchive({ root, fetchImpl: async () => new Response(jpeg) });
+  await assert.rejects(archive.save(event(), { manual: true }), /X_UNSAFE_PATH/);
+  fs.unlinkSync(path.join(root, 'x/manual/alice'));
+  fs.mkdirSync(path.join(root, 'x/manual/alice/media'), { recursive: true });
+  const conflict = path.join(root, 'x/manual/alice/media/123_01.jpg'); fs.writeFileSync(conflict, 'keep me');
+  const result = await archive.save(event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]), { manual: true });
+  assert.equal(result.errors.length, 1); assert.equal(fs.readFileSync(conflict, 'utf8'), 'keep me');
+});
+
+test('legacy manual events can be retained without fetching or changing automatic files', async t => {
+  const root = fixture(t), archive = new XArchive({ root, fetchImpl: async () => new Response(jpeg) });
+  const row = event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]);
+  const result = await archive.save(row), original = fs.readFileSync(path.join(root, 'x/alice/posts/123.json'));
+  archive.fetchImpl = async () => assert.fail('migration must never fetch');
+  const retained = await archive.retainManual(result);
+  assert.equal(retained.files[0].relativePath, 'x/manual/alice/media/123_01.jpg');
+  assert.deepEqual(fs.readFileSync(path.join(root, 'x/alice/posts/123.json')), original);
+  const manualFile = path.join(root, 'x/manual/alice/posts/123.json');
+  await archive.retainManual(result);
+  fs.writeFileSync(manualFile, '{"keep":"existing"}');
+  await assert.rejects(archive.retainManual(result), /X_ARCHIVE_CONFLICT/);
+  assert.equal(fs.readFileSync(manualFile, 'utf8'), '{"keep":"existing"}');
+  assert.deepEqual(fs.readFileSync(xFile(root, retained.files[0])), jpeg);
+});
+
+test('account names manual, posts and media coexist in both X archive layouts', async t => {
+  const root = fixture(t), archive = new XArchive({ root, fetchImpl: async () => new Response(jpeg) });
+  for (const username of ['manual', 'posts', 'media']) {
+    const row = { ...event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]), targetUsername: username, authorUsername: username };
+    const auto = await archive.save(row), manual = await archive.save(row, { manual: true });
+    assert.equal(auto.errors.length, 0); assert.equal(manual.errors.length, 0);
+    assert.equal(auto.files[0].relativePath, `x/${username}/media/123_01.jpg`);
+    assert.equal(manual.files[0].relativePath, `x/manual/${username}/media/123_01.jpg`);
+    assert.deepEqual(fs.readFileSync(xFile(root, auto.files[0])), jpeg);
+    assert.deepEqual(fs.readFileSync(xFile(root, manual.files[0])), jpeg);
+  }
+});
+
+test('legacy migration refuses an existing different media file even if its signature and size match', async t => {
+  const root = fixture(t), archive = new XArchive({ root, fetchImpl: async () => new Response(jpeg) });
+  const result = await archive.save(event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]));
+  const destination = path.join(root, 'x/manual/alice/media/123_01.jpg');
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const different = Buffer.from(jpeg); different[10] = 1; fs.writeFileSync(destination, different);
+  await assert.rejects(archive.retainManual(result), /X_ARCHIVE_CONFLICT/);
+  assert.deepEqual(fs.readFileSync(destination), different);
+  assert.deepEqual(fs.readFileSync(xFile(root, result.files[0])), jpeg);
+});
+
+test('manual metadata is reusable when compatible and never overwrites conflicts', async t => {
+  const root = fixture(t), archive = new XArchive({ root });
+  const row = event('123');
+  await archive.save(row, { manual: true });
+  await archive.save(row, { manual: true });
+  const textFile = path.join(root, 'x/manual/alice/posts/123.txt');
+  fs.writeFileSync(textFile, 'existing text');
+  await assert.rejects(archive.save(row, { manual: true }), /X_ARCHIVE_CONFLICT/);
+  assert.equal(fs.readFileSync(textFile, 'utf8'), 'existing text');
+  fs.writeFileSync(textFile, [row.url, row.text].join('\n\n'));
+  const manifest = path.join(root, 'x/manual/alice/posts/123.json');
+  fs.writeFileSync(manifest, '{"existing":true}');
+  await assert.rejects(archive.save(row, { manual: true }), /X_ARCHIVE_CONFLICT/);
+  assert.equal(fs.readFileSync(manifest, 'utf8'), '{"existing":true}');
+});
+
+test('cross-device retention cleans interrupted copies and publishes only complete files', async t => {
+  const root = fixture(t), archive = new XArchive({ root, fetchImpl: async () => new Response(jpeg) });
+  const result = await archive.save(event('123', [{ type: 'photo', url: 'https://pbs.twimg.com/media/a.jpg' }]));
+  const source = xFile(root, result.files[0]), destination = path.join(root, 'x/manual/alice/media/123_01.jpg');
+  const originalLink = fs.linkSync, originalCopy = fs.copyFileSync;
+  t.after(() => { fs.linkSync = originalLink; fs.copyFileSync = originalCopy; });
+  fs.linkSync = (from, to) => { if (from === source && to === destination) { const error = Error('cross device'); error.code = 'EXDEV'; throw error; } return originalLink(from, to); };
+  fs.copyFileSync = (_from, to) => { fs.writeFileSync(to, 'partial'); throw Error('interrupted'); };
+  await assert.rejects(archive.retainManual(result), /interrupted/);
+  assert.equal(fs.existsSync(destination), false);
+  assert.deepEqual(fs.readdirSync(path.dirname(destination)), []);
+  fs.copyFileSync = originalCopy;
+  await archive.retainManual(result);
+  assert.deepEqual(fs.readFileSync(destination), jpeg);
+});

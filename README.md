@@ -30,7 +30,7 @@ Docker mounts `IG_DOWNLOAD_DIR` (default: `./downloads`) at `/downloads` inside
 An existing `.env` also uses these defaults without adding new variables.
 
 ```text
-downloads/
+downloads/instagram/
   alice/
     stories/20261016_013000_JST_123456.mp4
     posts/00001_20261016_013000_JST/
@@ -44,6 +44,12 @@ downloads/
     posts/
     highlight/
 ```
+
+When upgrading an existing installation, stop all old watcher processes before
+starting the new version. The watcher moves registered Instagram account folders
+and the old `downloads/manual/` folder into `downloads/instagram/`. It keeps a
+migration journal and refuses to overwrite conflicting folders. Keep a private
+backup of the download and state directories before upgrading.
 
 Filenames use publication time in JST, with detection time as the Story fallback.
 Images retain their actual `.jpg`, `.png`, or `.webp` format. Post carousels retain
@@ -348,7 +354,7 @@ without re-encoding. The worker image includes FFmpeg. Original media and captio
 are retained permanently under:
 
 ```text
-downloads/manual/<username>/<post|story|highlight>/<content-id>/
+downloads/instagram/manual/<username>/<post|story|highlight>/<content-id>/
   001_<media-id>.jpg
   002_<media-id>.mp4
   manifest.json

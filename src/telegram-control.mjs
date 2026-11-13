@@ -18,8 +18,9 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
   const user = settings.users[id], health = read(path.join(stateDir, 'health.json'), null);
   const targets = Array.isArray(health?.targets) ? health.targets : [];
   const names = Object.keys(user?.targets || {});
-  const lines = ['你的監看狀態', `每日摘要：${user?.daily ? '開啟' : '關閉'}（異常與恢復通知保持開啟）`];
-  if (!names.length) lines.push('尚未加入任何監看帳號。');
+  const lines = ['📊 你的監看狀態', `每日摘要：${user?.daily ? '開啟' : '關閉'}（異常與恢復通知保持開啟）`];
+  lines.push('', '📷 Instagram', `監看帳號：${names.length}`);
+  if (!names.length) lines.push('尚未加入 Instagram 監看帳號。');
   for (const name of names) {
     const target = targets.find(t => t?.username === name);
     const catalog = target?.target && /^\d+$/.test(target.target) ? read(path.join(stateDir, `catalog-${target.target}.json`), null) : null;
@@ -31,15 +32,12 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
   if (xNames.length) {
     const xHealth = read(path.join(stateDir, 'x/health.json'), null);
     const xTargets = Array.isArray(xHealth?.targets) ? xHealth.targets : [];
-    lines.push('', 'X 監看狀態');
+    lines.push('', '𝕏 X', `監看帳號：${xNames.length}`);
     for (const name of xNames) {
       const target = xTargets.find(target => target?.username === name);
       lines.push(`X @${name}：${xHealth?.enabled === false ? '已停用' : !target ? '等待首次檢查' : target.failures ? '檢查異常／重試中' : '監看中'}${Number.isSafeInteger(target?.saved) ? `；已封存 ${target.saved}` : ''}${Number.isSafeInteger(target?.pending) ? `，待下載 ${target.pending}` : ''}`);
     }
     if (!xHealth || !Number.isFinite(xHealth.at) || Date.now() - xHealth.at > 120000) lines.push('X worker 心跳尚未建立或已過期。');
-    const locked = Number.isSafeInteger(xHealth?.pool?.locked) && xHealth.pool.locked >= 0 ? xHealth.pool.locked : 0;
-    if (Number.isSafeInteger(xHealth?.pool?.active)) lines.push(`X 回補帳號池：可用 ${Math.max(0, xHealth.pool.active - locked)}，限流等待 ${locked}`);
-    else lines.push('X 回補帳號池狀態尚未取得。');
     const shared = Array.isArray(xHealth?.historyJobs) ? xHealth.historyJobs.filter(job => job && xNames.includes(job.username)) : [];
     const requests = Object.values(settings.xRequests || {}).filter(request => request.userId === id && request.type === 'history' &&
       xNames.includes(request.username) && /^\d{1,20}-\d{1,16}-\d{1,2}$/.test(request.id)).sort((a, b) => b.at - a.at).slice(0, 20);
@@ -56,7 +54,13 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
       const key = `${job.username}:${identity}`, old = reportsById.get(key);
       if (!old || (Number.isFinite(job.at) ? job.at : 0) > (Number.isFinite(old.at) ? old.at : 0)) reportsById.set(key, job);
     }
-    const reports = [...reportsById.values()];
+    const reports = [...reportsById.values()].filter(job => ['queued', 'working', 'running', 'importing', 'retry'].includes(job.status) || (['complete', 'ready', 'partial'].includes(job.status) && job.reported !== true && ['archive', 'rendering'].includes(job.phase)));
+    if (reports.length) {
+      lines.push('', '歷史回補');
+    const locked = Number.isSafeInteger(xHealth?.pool?.locked) && xHealth.pool.locked >= 0 ? xHealth.pool.locked : 0;
+    if (Number.isSafeInteger(xHealth?.pool?.active)) lines.push(`X 回補帳號池：可用 ${Math.max(0, xHealth.pool.active - locked)}，限流等待 ${locked}`);
+    else lines.push('X 回補帳號池狀態尚未取得。');
+    }
     const priority = job => ['working', 'running', 'importing'].includes(job.status) || ['archive', 'rendering'].includes(job.phase) ? 0 : job.status === 'retry' ? 1 : job.status === 'queued' ? 2 : 3;
     const requestedAt = job => Number.isFinite(job.requestedAt) ? job.requestedAt : Number.isFinite(job.at) ? job.at : 0;
     reports.sort((a, b) => priority(a) - priority(b) || requestedAt(b) - requestedAt(a));
@@ -65,9 +69,10 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
   const issues = { ...read(path.join(stateDir, 'monitor/issues.json'), {}), ...(watchdogDir ? read(path.join(watchdogDir, 'issues.json'), {}) : {}) };
   const targetIds = new Set(targets.filter(t => t && names.includes(t.username)).map(t => t.target));
   const relevant = Object.entries(issues).filter(([key, v]) => v?.active && (!key.startsWith('target:') || targetIds.has(v.target) || v.usernames?.some(name => names.includes(name)) || names.some(name => key.startsWith(`target:${name}:`))));
-  lines.push(`目前異常：${relevant.length}`, ...relevant.slice(0, 6).map(([key, v]) => `${key}：${v.reason}`));
+  lines.push('', '🔎 系統狀態', `目前異常：${relevant.length}`, ...relevant.slice(0, 6).map(([key, v]) => `${key}：${v.reason}`));
   if (readErrors) lines.push(`有 ${readErrors} 份執行狀態讀取失敗，請檢查監控日誌。`);
   if (health && (!Number.isFinite(health.at) || Date.now() - health.at > 120000)) lines.push('監看程序心跳已過期，顯示的是先前紀錄。');
+  lines.push(`查詢時間：${new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Hong_Kong', dateStyle: 'short', timeStyle: 'medium', hour12: false }).format(new Date())}（香港）`);
   return lines.join('\n').slice(0, 3400);
 }
 

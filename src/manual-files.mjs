@@ -3,9 +3,16 @@ import path from 'node:path';
 import { mediaExtension } from './story-archive.mjs';
 
 export function manualPath(root, relative, { mkdir = false, directory = false } = {}) {
-  if (!path.isAbsolute(root) || typeof relative !== 'string' || !relative.startsWith('manual/') || relative.split(/[\\/]/).some(p => !p || p === '.' || p === '..') || relative.includes('\0')) throw Error('MANUAL_UNSAFE_PATH');
+  if (!path.isAbsolute(root) || typeof relative !== 'string' || !(relative.startsWith('manual/') || relative.startsWith('instagram/manual/')) || relative.split(/[\\/]/).some(p => !p || p === '.' || p === '..') || relative.includes('\0')) throw Error('MANUAL_UNSAFE_PATH');
   const rootStat = fs.lstatSync(root);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw Error('MANUAL_STORAGE_UNAVAILABLE');
+  // Historical manifests retain their original relative paths after migration.
+  if (relative.startsWith('manual/')) {
+    const migrated = path.join(root, 'instagram', 'manual');
+    const legacy = path.join(root, 'manual');
+    if (fs.existsSync(migrated) && fs.existsSync(legacy)) throw Error('MANUAL_UNSAFE_PATH');
+    if (fs.existsSync(migrated)) relative = 'instagram/' + relative;
+  }
   const parts = relative.split('/');
   let current = root;
   for (let i = 0; i < parts.length; i++) {

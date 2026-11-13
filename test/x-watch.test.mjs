@@ -188,3 +188,64 @@ test('legacy active history progress can rebuild membership without fetching or 
   await f.watcher.hydrateArchiveProgress();
   assert.equal(f.saves.length,1);assert.equal(job.archiveKeys.length,1);assert.equal(f.watcher.historyReport(job).archive.done,1);
 });
+
+test('new manual requests explicitly save into the manual namespace', async t => {
+  const f=fixture(t),id='200-8-0'; let options;
+  f.settings.xRequests[id]={id,userId:'200',type:'manual',username:'alice',url:'https://x.com/alice/status/8',at:100};
+  f.archive.save=async (event,opts)=>{options=opts;return{username:'alice',kind:event.kind,contentId:event.statusId,url:event.url,caption:event.text,files:[],errors:[]};};
+  f.watcher.fetchImpl=async()=>new Response(JSON.stringify({code:200,tweet:post('8')}));
+  f.watcher.syncRequests(1000);await f.watcher.manualRequests(1000);
+  assert.deepEqual(options,{manual:true});
+});
+
+test('legacy completed manual requests retain their identified archive without replaying events', async t => {
+  const f=fixture(t),id='200-8-0';let retained=0;
+  f.settings.xRequests[id]={id,userId:'200',type:'manual',username:'alice',url:'https://x.com/alice/status/8',at:100};
+  f.watcher.state.requests[id]={status:'complete',attempts:1};
+  const result={username:'alice',kind:'post',contentId:'8',url:'https://x.com/alice/status/8',caption:'old',files:[],errors:[]};
+  f.watcher.emit({type:'post',username:'alice',kind:'post',statusId:'8',at:100,manual:true,requestId:id,userId:'200',recipients:[{userId:'200'}],result},`manual:${id}`);
+  const original=events(f).find(e=>e.manual);
+  f.archive.retainManual=async saved=>{retained++;assert.deepEqual(saved,result);return saved;};
+  f.settings.allowedIds=[]; // Archival retention is independent of current delivery authorization.
+  await f.watcher.manualRequests(1000);await f.watcher.manualRequests(2000);
+  assert.equal(retained,1);assert.deepEqual(events(f).find(e=>e.manual),original);
+  assert.equal(f.watcher.state.requests[id].status,'complete');
+  assert.equal(f.watcher.state.requests[id].manualArchiveVersion,1);
+});
+
+test('legacy manual requests without trustworthy events remain unchanged with a migration reason', async t => {
+  const f=fixture(t),id='200-8-0';
+  f.settings.xRequests[id]={id,userId:'200',type:'manual',username:'alice',url:'https://x.com/alice/status/8',at:100};
+  f.watcher.state.requests[id]={status:'complete',attempts:1};
+  f.archive.retainManual=async()=>assert.fail('no reliable source event');
+  await f.watcher.manualRequests(1000);
+  assert.equal(f.watcher.state.requests[id].status,'complete');
+  assert.equal(f.watcher.state.requests[id].manualArchiveReason,'X_MANUAL_MIGRATION_EVENT_MISSING');
+});
+
+test('404 stays healthy until three consecutive polls, persists and resets on success',async t=>{
+  const f=fixture(t);let missing=false;
+  f.watcher.fetchImpl=async()=>new Response(JSON.stringify(missing?{code:404,results:[]}:{code:200,results:[post('1')]}),{status:missing?404:200});
+  await f.watcher.pollAccount('alice',1000);missing=true;
+  await f.watcher.pollAccount('alice',61000);
+  await f.watcher.pollAccount('alice',121000);
+  let a=f.watcher.account('alice');assert.equal(a.failures,0);assert.equal(a.consecutive404,2);assert.equal(a.nextAt,181000);
+  assert.equal(events(f).filter(e=>e.type==='notice').length,0);
+  const restarted=new XWatcher({...f,settings:()=>f.settings});
+  restarted.fetchImpl=f.watcher.fetchImpl;
+  await restarted.pollAccount('alice',181000);a=restarted.account('alice');
+  assert.equal(a.failures,1);assert.equal(a.consecutive404,3);
+  assert.equal(events(f).filter(e=>e.type==='notice'&&/監控異常/.test(e.text)).length,1);
+  missing=false;await restarted.pollAccount('alice',a.nextAt);
+  assert.equal(a.failures,0);assert.equal(a.consecutive404,0);
+  missing=true;await restarted.pollAccount('alice',a.nextAt);
+  assert.equal(a.failures,0);assert.equal(a.consecutive404,1);
+});
+test('a tolerated 404 does not hide a later downtime gap',async t=>{
+  const f=fixture(t);await f.watcher.pollAccount('alice',1700000000000);
+  f.watcher.fetchImpl=async()=>new Response('{}',{status:404});
+  await f.watcher.pollAccount('alice',1700000060000);
+  f.watcher.fetchImpl=f.fetchImpl;
+  await f.watcher.pollAccount('alice',1700100000000);
+  assert.ok(Object.values(f.watcher.state.history).some(j=>j.gap));
+});

@@ -66,7 +66,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     } else if (action === 'follow' && validUsername(name)) {
       if (!userTarget(user, name)) put(user.targets, name, subscription(now));
       result = accountMenu(user, name);
-    } else if (action === 'status') result = panel(statusText(id), [back]);
+    } else if (action === 'status') result = panel(statusText(id), [[button('🔄 重新整理', 'status')], back]);
     else if (action === 'set' && validUsername(name) && kinds.includes(kind) && ['0', '1'].includes(value) && userTarget(user, name)?.generation.slice(0, 8) === generation) {
       const preference = userTarget(user, name).notifications[kind];
       if (preference.enabled !== (value === '1')) { preference.enabled = value === '1'; preference.since = now; }
@@ -82,7 +82,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     const xResult = totalLinks > 10 || /^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text) ? undefined : xMessage(settings, user, id, text, linkedText, update.update_id, now);
     if (totalLinks > 10) result = panel('每則訊息最多 10 個連結，請分批傳送。', [back]);
     else if (/^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text)) { delete user.waiting; result = mainMenu(user); }
-    else if (/^\/status$/.test(text)) result = panel(statusText(id), [back]);
+    else if (/^\/status$/.test(text)) result = panel(statusText(id), [[button('🔄 重新整理', 'status')], back]);
     else if (xResult && !hasInstagramLinks(linkedText)) result = xResult;
     else if (/https?:\/\/|(?:^|\s)(?:www\.|m\.)?instagram\.com\//i.test(linkedText)) {
       try {

@@ -183,7 +183,7 @@ test('controlled worker downloads Story locally when every personal media notifi
       return { targetUserId: '101', storyCount: 1, stories: [story], guard: { blockedReadReceipt: 0 } };
     } });
   const archive = JSON.parse(fs.readFileSync(path.join(f.state, 'archive-101.json'), 'utf8'));
-  assert.ok(fs.existsSync(path.join(f.root, 'alice', archive.saved['789'].relativePath)));
+  assert.ok(fs.existsSync(path.join(f.root, 'instagram', 'alice', archive.saved['789'].relativePath)));
   const events = fs.readdirSync(path.join(f.state, 'telegram-events'));
   for (const file of events) f.delivery.ingest(JSON.parse(fs.readFileSync(path.join(f.state, 'telegram-events', file), 'utf8')));
   assert.equal(Object.keys(f.delivery.state.pending).length, 0);
@@ -375,4 +375,17 @@ test('removed-account incidents are suspended and aliases migrate one target sco
   issues.suspendAccount('alice', '101');
   assert.equal(issues.state['target:alice:fetch'].active, false);
   assert.equal(issues.state['target:bob:fetch'].active, true);
+});
+
+test('status commands and refresh callbacks offer a fresh status button',t=>{
+  const f=fixture(t);let version=0;const describe=()=>`status ${++version}`;
+  applyUpdate(f.settings,message(501,100,'/status'),1000,describe);
+  let body=f.settings.replies['reply:501'].body;
+  assert.equal(body.text,'status 1');assert.equal(body.reply_markup.inline_keyboard[0][0].callback_data,'status');
+  applyUpdate(f.settings,callback(502,100,'status'),1001,describe);
+  body=f.settings.replies['reply:502'].body;assert.equal(body.text,'status 2');
+  f.settings.users['100'].daily=true;
+  f.delivery.daily(Date.UTC(2026,10,14,12),describe);
+  const summary=Object.values(f.delivery.state.pending).find(task=>task.type==='summary');
+  assert.equal(summary.body.reply_markup.inline_keyboard[0][0].callback_data,'status');
 });

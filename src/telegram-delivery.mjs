@@ -128,7 +128,7 @@ export class PersonalDelivery {
     for (const id of s.allowedIds) {
       if (!s.users[id]?.daily || this.state.summaries[id] === day) continue;
       this.enqueue(`summary:${day}:${id}`, { userId: id, type: 'summary', day,
-        method: 'sendMessage', body: { chat_id: id, text: `每日摘要（香港時間 20:00）\n${describe(id)}` } });
+        method: 'sendMessage', body: { chat_id: id, text: `每日摘要（香港時間 20:00）\n${describe(id)}`, reply_markup: { inline_keyboard: [[{ text: '🔄 查看最新狀態', callback_data: 'status' }]] } } });
       this.state.summaries[id] = day;
     }
     this.persist();

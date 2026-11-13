@@ -29,7 +29,7 @@ function validateEvent(event) {
       !object(result) || result.username !== event.username || typeof result.caption !== 'string' || result.caption.length > 1000000 ||
       !statusUrl(result.url) || !Array.isArray(result.files) || !Array.isArray(result.errors) || result.files.length > 1000 ||
       result.files.some(file => !object(file) || !Number.isSafeInteger(file.bytes) || file.bytes < 12 || ![1, 2].includes(file.mediaType) ||
-        typeof file.relativePath !== 'string' || !file.relativePath.startsWith(`x/${event.username}/`) ||
+        typeof file.relativePath !== 'string' || !(file.relativePath.startsWith(`x/${event.username}/media/`) || (event.manual && file.relativePath.startsWith(`x/manual/${event.username}/media/`))) ||
         file.relativePath.split(/[\\/]/).some(part => !part || part === '.' || part === '..') || file.relativePath.includes('\0'))) throw Error('X_EVENT_INVALID');
   if (event.manual && (!userId(event.userId) || typeof event.requestId !== 'string' || !new RegExp(`^${event.userId}-\\d+-\\d+$`).test(event.requestId))) throw Error('X_EVENT_INVALID');
   return event;
@@ -195,7 +195,7 @@ export class XDelivery {
         plan.oversized.length || result?.errors.length ? [
           plan.oversized.length ? `${plan.oversized.length} 個檔案過大，已下載但無法直接傳送。` : '',
           result.errors.length ? `${result.errors.length} 個媒體未能下載；其他可取得內容已回傳。` : '',
-          `本機位置：downloads/x/${event.username}/`, result.url,
+          `本機位置：downloads/x/${event.manual ? 'manual/' : ''}${event.username}/`, result.url,
         ].filter(Boolean).join('\n') : '';
     if (!await this.report(client, event, recipient, entry, report)) return false;
     entry.done = true; this.persist();

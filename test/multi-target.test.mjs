@@ -101,7 +101,7 @@ test('legacy directories migrate once and preserve records and per-account paths
   const stateFile = path.join(f.state, 'archive-101.json'); fs.writeFileSync(stateFile, '{"target":"101"}');
   const alice = accountArchiveRoot(f.root, f.state, '101', 'alice');
   const bob = accountArchiveRoot(f.root, f.state, '202', 'bob');
-  assert.equal(alice, path.join(f.root, 'alice')); assert.equal(bob, path.join(f.root, 'bob'));
+  assert.equal(alice, path.join(f.root, 'instagram/alice')); assert.equal(bob, path.join(f.root, 'instagram/bob'));
   assert.equal(fs.readFileSync(path.join(alice, 'stories/old.txt'), 'utf8'), 'stories');
   assert.equal(fs.existsSync(path.join(bob, 'stories/old.txt')), false);
   assert.equal(fs.readFileSync(stateFile, 'utf8'), '{"target":"101"}');
@@ -115,7 +115,7 @@ test('interrupted migration resumes without overwriting or reassigning files', t
   fs.mkdirSync(path.join(f.root, 'alice')); fs.mkdirSync(path.join(f.root, 'alice/stories')); fs.mkdirSync(path.join(f.root, 'posts'));
   fs.writeFileSync(path.join(f.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'alice' }, legacyChecked: true, migration: { owner: '101', groups: ['stories', 'posts'] } }));
   accountArchiveRoot(f.root, f.state, '101', 'alice');
-  assert.equal(fs.existsSync(path.join(f.root, 'alice/posts')), true);
+  assert.equal(fs.existsSync(path.join(f.root, 'instagram/alice/posts')), true);
   assert.equal(read(path.join(f.state, 'archive-layout.json')).migration, null);
 });
 
@@ -204,7 +204,7 @@ test('old account second in the new list keeps its username folder and saved his
   };
   await main({ env: { ...env, IG_ARCHIVE_DIR: f.root }, args: ['--once'], dir: f.state, resolve, fetcher, sleepImpl: async () => {} });
   assert.deepEqual(calls, ['101', '202']);
-  assert.equal(fs.readFileSync(path.join(f.root, 'bob/stories/old.jpg'), 'utf8'), 'preserved-media');
+  assert.equal(fs.readFileSync(path.join(f.root, 'instagram/bob/stories/old.jpg'), 'utf8'), 'preserved-media');
   assert.equal(read(path.join(f.state, 'archive-202.json')).saved['789'].relativePath, 'stories/old.jpg');
   assert.equal(read(path.join(f.state, 'archive-layout.json')).accounts['202'], 'bob');
 });
@@ -287,4 +287,82 @@ test('Telegram rate limits apply to every account and survive a worker restart',
   await main(options);
   assert.equal(attempts, 1, 'a fresh worker must retain the shared cooldown');
   process.exitCode = 0;
+});
+
+test('platform migration resumes after a rename and preserves old manual paths', async t => {
+  const f = fixture(t);
+  const { migrateInstagramLayout } = await import('../src/archive-layout.mjs');
+  const { manualPath } = await import('../src/manual-files.mjs');
+  fs.mkdirSync(path.join(f.root, 'instagram/manual/alice'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'instagram/manual/alice/photo.jpg'), 'original');
+  fs.writeFileSync(path.join(f.state, 'instagram-layout.json'), JSON.stringify({ version: 1, pending: 'manual', completed: [] }));
+  migrateInstagramLayout(f.root, f.state);
+  assert.equal(fs.readFileSync(manualPath(f.root, 'manual/alice/photo.jpg'), 'utf8'), 'original');
+  assert.equal(read(path.join(f.state, 'instagram-layout.json')).pending, null);
+});
+
+test('platform migration refuses conflicts and retains both original directories', async t => {
+  const f = fixture(t);
+  const { migrateInstagramLayout } = await import('../src/archive-layout.mjs');
+  fs.mkdirSync(path.join(f.root, 'manual'));
+  fs.mkdirSync(path.join(f.root, 'instagram/manual'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'manual/old'), 'old');
+  fs.writeFileSync(path.join(f.root, 'instagram/manual/new'), 'new');
+  assert.throws(() => migrateInstagramLayout(f.root, f.state), /DESTINATION_EXISTS/);
+  assert.equal(fs.readFileSync(path.join(f.root, 'manual/old'), 'utf8'), 'old');
+  assert.equal(fs.readFileSync(path.join(f.root, 'instagram/manual/new'), 'utf8'), 'new');
+});
+
+test('platform migration includes accounts that are no longer monitored', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'old_account/posts'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'old_account/posts/file'), 'preserved');
+  fs.writeFileSync(path.join(f.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'alice', 202: 'old_account' }, legacyChecked: true, migration: null }));
+  accountArchiveRoot(f.root, f.state, '101', 'alice');
+  assert.equal(fs.readFileSync(path.join(f.root, 'instagram/old_account/posts/file'), 'utf8'), 'preserved');
+  assert.equal(fs.existsSync(path.join(f.root, 'old_account')), false);
+});
+
+test('new accounts cannot adopt existing or case-variant Instagram folders', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'instagram/Alice'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'instagram/Alice/keep'), 'other');
+  assert.throws(() => accountArchiveRoot(f.root, f.state, '101', 'alice'), /ACCOUNT_COLLISION/);
+  assert.equal(fs.readFileSync(path.join(f.root, 'instagram/Alice/keep'), 'utf8'), 'other');
+  fs.writeFileSync(path.join(f.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'Alice', 202: 'alice' }, legacyChecked: true, migration: null }));
+  assert.throws(() => accountArchiveRoot(f.root, f.state, '101', 'alice'), /ACCOUNT_COLLISION/);
+});
+
+test('concurrent layout updates are refused without modifying migration history', async t => {
+  const f = fixture(t);
+  const { migrateInstagramLayout } = await import('../src/archive-layout.mjs');
+  fs.mkdirSync(path.join(f.state, '.instagram-layout.lock'));
+  fs.mkdirSync(path.join(f.root, 'manual'));
+  assert.throws(() => migrateInstagramLayout(f.root, f.state), /LAYOUT_LOCKED/);
+  assert.throws(() => accountArchiveRoot(f.root, f.state, '101', 'alice'), /LAYOUT_LOCKED/);
+  assert.equal(fs.existsSync(path.join(f.root, 'manual')), true);
+  fs.rmdirSync(path.join(f.state, '.instagram-layout.lock'));
+  migrateInstagramLayout(f.root, f.state);
+  assert.equal(fs.existsSync(path.join(f.root, 'instagram/manual')), true);
+});
+
+test('reserved account names are case-insensitive and cannot claim manual storage', t => {
+  const f = fixture(t);
+  for (const [id, username] of [['101', 'Manual'], ['102', 'Instagram'], ['103', 'X'], ['104', 'Posts']]) {
+    assert.equal(accountArchiveRoot(f.root, f.state, id, username), path.join(f.root, 'instagram', `${username}_${id}`));
+  }
+  const other = fixture(t);
+  fs.mkdirSync(path.join(other.root, 'Manual'));
+  fs.writeFileSync(path.join(other.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'Manual' }, legacyChecked: true, migration: null }));
+  assert.throws(() => accountArchiveRoot(other.root, other.state, '101', 'Manual'), /OWNER_AMBIGUOUS/);
+  assert.equal(fs.existsSync(path.join(other.root, 'Manual')), true);
+});
+
+test('registered account does not adopt a destination without migration history', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'instagram/alice'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'instagram/alice/keep'), 'unrelated');
+  fs.writeFileSync(path.join(f.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'alice' }, legacyChecked: true, migration: null }));
+  assert.throws(() => accountArchiveRoot(f.root, f.state, '101', 'alice'), /DESTINATION_EXISTS/);
+  assert.equal(fs.readFileSync(path.join(f.root, 'instagram/alice/keep'), 'utf8'), 'unrelated');
 });

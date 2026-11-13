@@ -8,6 +8,7 @@ import { downloadStory, archiveReason } from './story-archive.mjs';
 import { manualPath, validManualFile } from './manual-files.mjs';
 import { parseInstagramLink, manualJobId, shortcodeId } from './instagram-links.mjs';
 import { validMediaUrl } from './story-media.mjs';
+import { migrateInstagramLayout } from './archive-layout.mjs';
 import { validUsername } from './telegram-settings.mjs';
 
 export const jobDirectory = dir => path.join(dir, 'manual', 'jobs');
@@ -93,7 +94,8 @@ export class ManualJobs {
     job.status = 'working'; job.attempts++; job.retryAt = 0; this.persist(job);
     const progress = (phase, seconds = 330) => this.log('MANUAL_WORK', { phase, seconds, jobId: job.id });
     try {
-      manualPath(this.root, 'manual/.probe', { mkdir: true });
+      migrateInstagramLayout(this.root, this.stateDir);
+      manualPath(this.root, 'instagram/manual/.probe', { mkdir: true });
       const spec = parseInstagramLink(request.url);
       if (spec.kind === 'profile') throw Error('MANUAL_UNSUPPORTED_LINK');
       const cached = this.cached(spec);
@@ -109,7 +111,7 @@ export class ManualJobs {
           (result.identity !== spec.identity || result.kind !== spec.kind || result.contentId !== (spec.kind === 'post' ? shortcodeId(spec.shortcode) : spec.contentId) ||
            (spec.kind === 'story' && result.username !== spec.username)))) throw Error('MANUAL_TARGET_MISMATCH');
       if (new Set(result.media.map(m => m.id)).size !== result.media.length) throw Error('MANUAL_UNTRUSTED_RESULT');
-      const folder = `manual/${result.username}/${result.kind}/${result.contentId}`;
+      const folder = `instagram/manual/${result.username}/${result.kind}/${result.contentId}`;
       manualPath(this.root, folder, { mkdir: true, directory: true });
       const savedById = new Map();
       for (const old of job.result?.files || job.files || []) {

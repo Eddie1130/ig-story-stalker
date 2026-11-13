@@ -138,7 +138,7 @@ export class XWatcher {
   async pollAccount(name,now) {
     const a=this.account(name);if(now<a.nextAt)return;
     // A stopped container cannot record fetch errors. Infer a gap from its checkpoint.
-    if(a.baseline&&a.lastSuccess&&now-a.lastSuccess>this.interval*2)a.gapStart ||= a.lastSuccess;
+    if(a.baseline&&a.lastSuccess&&(!a.consecutive404||now>a.nextAt+this.interval*2)&&now-a.lastSuccess>this.interval*2)a.gapStart ||= a.lastSuccess;
     const subscribers=this.subscriptions(name);
     try {
       const payload=await this.json(`https://api.fxtwitter.com/2/profile/${name}/statuses?count=100&with_replies=1`);
@@ -159,11 +159,17 @@ export class XWatcher {
         this.notice(`X @${name} 監控已恢復；中斷期間已排入歷史補抓，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
         delete a.gapStart;
       }
-      a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;delete a.reason;
+      a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;a.consecutive404=0;delete a.reason;
       this.persist();
     } catch(error) {
       if(error.code)throw error;
-      a.failures++;a.reason=safeReason(error);
+      const fetchReason=safeReason(error);
+      a.consecutive404=fetchReason==='X_HTTP_404'?(a.consecutive404||0)+1:0;
+      if(fetchReason==='X_HTTP_404'&&a.consecutive404<3&&a.failures===0) {
+        a.nextAt=now+this.interval;
+        this.persist();return;
+      }
+      a.failures++;a.reason=fetchReason;
       if(a.baseline) a.gapStart ||= a.lastSuccess;
       a.nextAt=now+Math.min(3600000,this.interval*2**Math.min(a.failures,6));
       if(a.failures===1)this.notice(`X @${name} 監控異常：${a.reason}。將退避重試。`,name,`${name}:fetch:${now}`);
@@ -191,7 +197,30 @@ export class XWatcher {
         this.persist();
     }
   }
+  async retainLegacyManualRequests(now) {
+    if(typeof this.archive.retainManual!=='function')return;
+    const settings=this.settings();
+    let changed=false;
+    for(const request of Object.values(settings.xRequests || {})) {
+      const task=this.state.requests[request.id];
+      if(request.type!=='manual'||task?.status!=='complete'||task.manualArchiveVersion===1||now<(task.manualArchiveRetryAt||0))continue;
+      try {
+        const link=parseXLink(request.url),file=path.join(this.dir,'events',hash(`manual:${request.id}`)+'.json');
+        if(!fs.existsSync(file))throw Error('X_MANUAL_MIGRATION_EVENT_MISSING');
+        const stat=fs.lstatSync(file);if(stat.isSymbolicLink()||!stat.isFile()||stat.size>4000000)throw Error('X_MANUAL_MIGRATION_EVENT_INVALID');
+        const event=load(file,null);
+        if(link.kind!=='post'||link.username!==request.username||event?.manual!==true||event.type!=='post'||event.requestId!==request.id||event.userId!==request.userId||event.username!==request.username||event.statusId!==link.statusId||event.result?.username!==request.username||event.result?.contentId!==link.statusId||parseXLink(event.result.url).statusId!==link.statusId)throw Error('X_MANUAL_MIGRATION_EVENT_INVALID');
+        await this.archive.retainManual(event.result);
+        task.manualArchiveVersion=1;delete task.manualArchiveReason;delete task.manualArchiveRetryAt;
+      } catch(error) {
+        task.manualArchiveReason=safeReason(error);task.manualArchiveRetryAt=now+300000;
+      }
+      changed=true;
+    }
+    if(changed)this.persist();
+  }
   async manualRequests(now) {
+    await this.retainLegacyManualRequests(now);
     const s=this.settings();
     for(const r of Object.values(s.xRequests || {})) {
       const task=this.state.requests[r.id];
@@ -200,10 +229,10 @@ export class XWatcher {
         const link=parseXLink(r.url);
         if(link.kind!=='post'||link.username!==r.username)throw Error('X_INVALID_LINK');
         const payload=await this.json(`https://api.fxtwitter.com/${link.username}/status/${link.statusId}`);
-        const e=normalizeFxPost(payload,link), result=await this.archive.save(e);
+        const e=normalizeFxPost(payload,link), result=await this.archive.save(e,{manual:true});
         if(result.errors?.length)throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');
         this.emit({type:'post',username:e.targetUsername,kind:e.kind,statusId:e.statusId,publishedAt:e.publishedAt,at:r.at,manual:true,requestId:r.id,userId:r.userId,recipients:[{userId:r.userId}],result},`manual:${r.id}`);
-        task.status='complete';
+        task.status='complete';task.manualArchiveVersion=1;
       } catch(error) {
         task.attempts++;task.reason=safeReason(error);task.retryAt=now+30000;
         task.status=task.attempts>=3?'failed':'retry';

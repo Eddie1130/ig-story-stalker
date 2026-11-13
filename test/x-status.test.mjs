@@ -187,3 +187,20 @@ test('shared active jobs are visible only for subscribed targets and detailed re
   assert.doesNotMatch(text, /bob|BOB_PRIVATE_ERROR/);
   assert.ok(text.length <= 3400);
 });
+
+test('platform sections hide completed backfills and their pool, but keep active archival work',t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'status-sections-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const settings={users:{100:{daily:true,targets:{},xTargets:{alice:{}}}}};
+  const health={at:Date.now(),pool:{active:3,locked:1},historyJobs:[job({username:'alice',status:'complete',phase:'finished',reported:true})]};
+  atomic(path.join(dir,'x/health.json'),health);
+  let text=describeUser(settings,'100',dir);
+  assert.match(text,/Instagram/);assert.match(text,/𝕏 X/);assert.match(text,/查詢時間/);
+  assert.doesNotMatch(text,/歷史回補 @|回補帳號池/);
+  health.historyJobs.push(job({username:'alice',id:'active',status:'retry',phase:'waiting'}));
+  atomic(path.join(dir,'x/health.json'),health);text=describeUser(settings,'100',dir);
+  assert.match(text,/回補帳號池：可用 2，限流等待 1/);
+  assert.equal(text.match(/歷史回補 @alice/g).length,1);
+  health.historyJobs=[job({username:'alice',status:'partial',phase:'archive',reported:false})];
+  atomic(path.join(dir,'x/health.json'),health);
+  assert.match(describeUser(settings,'100',dir),/歷史回補 @alice/);
+});

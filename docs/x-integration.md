@@ -90,6 +90,11 @@ downloads/x/alice/
   alice_media_urls.txt
   media_manifest.json
   extract.md
+
+downloads/x/manual/alice/
+  posts/<貼文ID>.json
+  posts/<貼文ID>.txt
+  media/<來源ID>_<序號>.jpg
 ```
 
 圖片使用序號 1 起算，影片／GIF 從 1001 起算，以來源貼文 ID 與同類媒體序號識別，避免不同來源的圖片／影片分組方式造成檔案碰撞。日常資料即時寫入 `posts/`；SQLite／JSONL／Markdown 是歷史作業的匯出，並非日常資料的即時資料庫。
