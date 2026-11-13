@@ -20,3 +20,13 @@ coverage/
 
 # Downloaded Instagram media
 downloads/
+
+# X account pools and Python runtime files
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+.venv/
+# Original n8n export contains private deployment credentials.
+X Twitter Multi Account Monitor + NAS Archive.json

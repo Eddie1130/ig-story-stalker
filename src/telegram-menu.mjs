@@ -1,13 +1,15 @@
 import { instagramLinks } from './instagram-links.mjs';
 import { kinds, validUsername, userTarget, put } from './telegram-settings.mjs';
 import { subscription } from './telegram-settings.mjs';
+import { xCallback, xMessage, xLinkPattern, hasInstagramLinks, combinePanels } from './x-menu.mjs';
 
 const labels = { story: 'Story', post: '貼文', highlight: '精選' };
 const button = (text, callback_data) => ({ text, callback_data });
 const panel = (text, rows) => ({ text, reply_markup: { inline_keyboard: rows } });
 const back = [button('⬅️ 主選單', 'menu')];
 export function mainMenu(user) {
-  return panel('IG 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
+  return panel('Instagram／X 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
+    [button('📷 Instagram', 'ig:menu'), button('𝕏 X / Twitter', 'x:menu')],
     [button('👥 監看帳號', 'list:0'), button('➕ 新增帳號', 'add')],
     [button('🔔 媒體通知', 'list:0')],
     [button(`📋 每日摘要：${user.daily ? '開啟' : '關閉'}`, `daily:${user.daily ? 0 : 1}`)],
@@ -50,7 +52,8 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     settings.replies[`ack:${update.update_id}`] = { method: 'answerCallbackQuery', body: { callback_query_id: callback.id }, userId: id, at: now };
     const parts = String(callback.data || '').split(':');
     const [action, name, kind, value, generation] = parts;
-    if (action === 'menu') { delete user.waiting; result = mainMenu(user); }
+    if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
+    else if (action === 'menu' || (action === 'ig' && name === 'menu')) { delete user.waiting; result = mainMenu(user); }
     else if (action === 'list' && /^\d{1,5}$/.test(name)) result = listMenu(user, Number(name));
     else if (action === 'account' && validUsername(name)) result = accountMenu(user, name);
     else if (action === 'add') { user.waiting = 'add'; result = panel('請傳送要監看的 Instagram 使用者名稱，例如 alice 或 @alice。\n輸入 /cancel 可取消。', [back]); }
@@ -75,11 +78,15 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
   } else {
     const text = String(message.text || message.caption || '').trim();
     const linkedText = [text, ...(message.entities || message.caption_entities || []).filter(e => e.type === 'text_link' && typeof e.url === 'string').map(e => e.url)].join(' ');
-    if (/^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text)) { delete user.waiting; result = mainMenu(user); }
+    const totalLinks = (linkedText.match(/(?:https?:\/\/[^\s<>"']+|(?:(?:www|mobile|m)\.)?(?:instagram|x|twitter|fxtwitter)\.com\/[^\s<>"']+)/gi) || []).length;
+    const xResult = totalLinks > 10 || /^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text) ? undefined : xMessage(settings, user, id, text, linkedText, update.update_id, now);
+    if (totalLinks > 10) result = panel('每則訊息最多 10 個連結，請分批傳送。', [back]);
+    else if (/^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text)) { delete user.waiting; result = mainMenu(user); }
     else if (/^\/status$/.test(text)) result = panel(statusText(id), [back]);
+    else if (xResult && !hasInstagramLinks(linkedText)) result = xResult;
     else if (/https?:\/\/|(?:^|\s)(?:www\.|m\.)?instagram\.com\//i.test(linkedText)) {
       try {
-        const links = instagramLinks(linkedText);
+        const links = instagramLinks(xResult ? linkedText.replace(xLinkPattern, '') : linkedText);
         if (!links.length) throw Error('MANUAL_INVALID_LINK');
         const profiles = links.filter(link => link.kind === 'profile');
         const content = links.filter(link => !['profile','invalid'].includes(link.kind));
@@ -108,6 +115,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
         result = panel(`${existing ? '已在你的清單中' : '已加入監看'}：@${name}\n目前可取得的 Story 會依設定通知；舊貼文與精選只下載。\n若帳號不存在或無法存取，會顯示異常通知。`, [[button('設定通知', 'account:' + name)], back]);
       }
     } else result = mainMenu(user);
+    if (xResult && hasInstagramLinks(linkedText)) result = combinePanels(result, xResult);
   }
   settings.replies[`reply:${update.update_id}`] = { method: 'sendMessage', body: { chat_id: id, ...result }, userId: id, at: now };
   return true;

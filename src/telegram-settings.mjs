@@ -4,6 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomic, load } from './error-monitor.mjs';
 import { configuredTargets } from './target-config.mjs';
+import { validateXSettings, configuredXTargets } from './x-settings.mjs';
 
 export const kinds = ['story', 'post', 'highlight'];
 export const validUsername = name => typeof name === 'string' && /^[a-z0-9_.]{1,30}$/.test(name) && !['.', '..'].includes(name);
@@ -37,6 +38,7 @@ export function validateSettings(s) {
     }
   }
   for (const [name, id] of Object.entries(s.legacyIds)) if (!validUsername(name) || !/^\d+$/.test(id)) throw Error('TELEGRAM_SETTINGS_INVALID');
+  validateXSettings(s);
   return s;
 }
 export function readSettings(file) {
@@ -54,7 +56,7 @@ export function initializeSettings(env, now = Date.now()) {
   if (s === null && !fs.existsSync(file)) {
     const targets = [env.IG_TARGET_USERNAMES, env.IG_TARGET_USERNAME, env.IG_TARGET_USER_ID].some(v => v?.trim()) ? configuredTargets(env) : [];
     s = { version: 1, ownerId, allowedIds, offset: 0, users: {}, replies: {}, legacyIds: {} };
-    s.users[ownerId] = { daily: false, targets: Object.fromEntries(targets.map(t => [t.username, subscription(now)])) };
+    s.users[ownerId] = { daily: false, targets: Object.fromEntries(targets.map(t => [t.username, subscription(now)])), xTargets: configuredXTargets(env.X_TARGET_USERNAMES, now) };
     for (const t of targets) if (t.target) put(s.legacyIds, t.username, t.target);
   } else {
     validateSettings(s);

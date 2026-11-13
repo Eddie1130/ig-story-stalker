@@ -9,6 +9,8 @@ import { eventDirectory } from './telegram-events.mjs';
 import { applyUpdate } from './telegram-menu.mjs';
 import { PersonalDelivery } from './telegram-delivery.mjs';
 import { TelegramClient } from './telegram-client.mjs';
+import { XDelivery } from './x-delivery.mjs';
+import { formatXHistory, compactXHistory } from './x-status.mjs';
 
 export function describeUser(settings, id, stateDir, watchdogDir = null) {
   let readErrors = 0;
@@ -24,6 +26,41 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
     const assets = Object.values(catalog?.assets || {});
     const pending = assets.filter(a => !a?.archiveDone).length;
     lines.push(`@${name}：${!target ? '等待解析帳號' : target.failures ? '檢查異常／重試中' : '監看中'}；貼文／精選已下載 ${assets.length - pending}，待下載 ${pending}`);
+  }
+  const xNames = Object.keys(user?.xTargets || {});
+  if (xNames.length) {
+    const xHealth = read(path.join(stateDir, 'x/health.json'), null);
+    const xTargets = Array.isArray(xHealth?.targets) ? xHealth.targets : [];
+    lines.push('', 'X 監看狀態');
+    for (const name of xNames) {
+      const target = xTargets.find(target => target?.username === name);
+      lines.push(`X @${name}：${xHealth?.enabled === false ? '已停用' : !target ? '等待首次檢查' : target.failures ? '檢查異常／重試中' : '監看中'}${Number.isSafeInteger(target?.saved) ? `；已封存 ${target.saved}` : ''}${Number.isSafeInteger(target?.pending) ? `，待下載 ${target.pending}` : ''}`);
+    }
+    if (!xHealth || !Number.isFinite(xHealth.at) || Date.now() - xHealth.at > 120000) lines.push('X worker 心跳尚未建立或已過期。');
+    const locked = Number.isSafeInteger(xHealth?.pool?.locked) && xHealth.pool.locked >= 0 ? xHealth.pool.locked : 0;
+    if (Number.isSafeInteger(xHealth?.pool?.active)) lines.push(`X 回補帳號池：可用 ${Math.max(0, xHealth.pool.active - locked)}，限流等待 ${locked}`);
+    else lines.push('X 回補帳號池狀態尚未取得。');
+    const shared = Array.isArray(xHealth?.historyJobs) ? xHealth.historyJobs.filter(job => job && xNames.includes(job.username)) : [];
+    const requests = Object.values(settings.xRequests || {}).filter(request => request.userId === id && request.type === 'history' &&
+      xNames.includes(request.username) && /^\d{1,20}-\d{1,16}-\d{1,2}$/.test(request.id)).sort((a, b) => b.at - a.at).slice(0, 20);
+    const reportCandidates = requests.map(request => {
+      const saved = read(path.join(stateDir, 'x/jobs', request.id + '.json'), null);
+      if (saved && typeof saved === 'object' && !Array.isArray(saved) && (!saved.username || saved.username === request.username)) return { ...saved, username: request.username };
+      const active = shared.find(job => job.username === request.username && (!request.start || request.start === job.start) && (!request.end || request.end === job.end));
+      return active || { username: request.username, status: 'queued', requestedAt: request.at, start: request.start, end: request.end };
+    });
+    const reportsById = new Map();
+    for (const job of [...reportCandidates, ...shared]) {
+      const identity = typeof job.id === 'string' && job.id.length <= 128 ? job.id :
+        `${typeof job.start === 'string' && job.start.length <= 10 ? job.start : ''}:${typeof job.end === 'string' && job.end.length <= 10 ? job.end : ''}`;
+      const key = `${job.username}:${identity}`, old = reportsById.get(key);
+      if (!old || (Number.isFinite(job.at) ? job.at : 0) > (Number.isFinite(old.at) ? old.at : 0)) reportsById.set(key, job);
+    }
+    const reports = [...reportsById.values()];
+    const priority = job => ['working', 'running', 'importing'].includes(job.status) || ['archive', 'rendering'].includes(job.phase) ? 0 : job.status === 'retry' ? 1 : job.status === 'queued' ? 2 : 3;
+    const requestedAt = job => Number.isFinite(job.requestedAt) ? job.requestedAt : Number.isFinite(job.at) ? job.at : 0;
+    reports.sort((a, b) => priority(a) - priority(b) || requestedAt(b) - requestedAt(a));
+    for (const [index, job] of reports.slice(0, 5).entries()) lines.push(index < 2 ? formatXHistory(job) : compactXHistory(job));
   }
   const issues = { ...read(path.join(stateDir, 'monitor/issues.json'), {}), ...(watchdogDir ? read(path.join(watchdogDir, 'issues.json'), {}) : {}) };
   const targetIds = new Set(targets.filter(t => t && names.includes(t.username)).map(t => t.target));
@@ -49,22 +86,23 @@ export async function run({ env = process.env, args = process.argv } = {}) {
   }
   let settings = initializeSettings(env);
   const signal = new AbortController();
-  let stopping = false, telegramOk = true, pollOk = true, lastPollAt = Date.now();
+  let stopping = false, telegramOk = true, xTelegramOk = true, pollOk = true, lastPollAt = Date.now();
   const stop = () => { stopping = true; signal.abort(); };
   for (const name of ['SIGTERM', 'SIGINT']) process.on(name, stop);
   const wait = ms => new Promise(resolve => { const t = setTimeout(done, ms); function done() { clearTimeout(t); signal.signal.removeEventListener('abort', done); resolve(); } signal.signal.addEventListener('abort', done, { once: true }); if (stopping) done(); });
   const client = new TelegramClient({ token: env.TELEGRAM_BOT_TOKEN, dir, signal: signal.signal, sleep: wait });
   const delivery = new PersonalDelivery({ dir, stateDir, settings: () => settings, log });
   const manual = new ManualDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
+  const xDelivery = env.X_ENABLED === '0' ? null : new XDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
   const persistSettings = () => atomic(settingsFile(env), settings);
   const describe = id => describeUser(settings, id, stateDir, env.IG_WATCHDOG_DIR || '/app/watchdog-state');
-  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
+  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
   const heartbeat = setInterval(health, 15000);
   try {
     // Do not silently delete another deployment's webhook or pending updates.
     const webhook = await client.call('getWebhookInfo', {}, { polling: true });
     if (webhook?.url) throw Error('TELEGRAM_WEBHOOK_CONFIGURED');
-    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟個人設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增監看帳號，例如 /add alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 連結下載原檔' }] });
+    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
     await client.call('setChatMenuButton', { menu_button: { type: 'commands' } });
     health(); log('TELEGRAM_CONTROL_STARTED');
     async function poll() {
@@ -106,8 +144,15 @@ export async function run({ env = process.env, args = process.argv } = {}) {
         if (!args.includes('--once')) await wait(1000);
       } while (!stopping && !args.includes('--once'));
     }
-    await Promise.all([poll(), dispatch(), manualDispatch()]);
-    if (args.includes('--once')) process.exitCode = pollOk && telegramOk ? 0 : 1;
+    async function xDispatch() {
+      if (!xDelivery) return;
+      do {
+        xTelegramOk = await xDelivery.drain(client, { stopping: () => stopping });
+        if (!args.includes('--once')) await wait(1000);
+      } while (!stopping && !args.includes('--once'));
+    }
+    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch()]);
+    if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk ? 0 : 1;
   } finally {
     stopping = true; signal.abort(); clearInterval(heartbeat);
     for (const name of ['SIGTERM', 'SIGINT']) process.off(name, stop);

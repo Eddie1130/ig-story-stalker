@@ -20,5 +20,14 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Check JavaScript syntax
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test IG and X
         run: npm test
+      - name: Check all JavaScript entry points
+        run: |
+          for file in src/*.mjs; do node --check "$file"; done
+      - name: Test X history without live credentials
+        run: python -m unittest discover -s test -p test_x_history.py

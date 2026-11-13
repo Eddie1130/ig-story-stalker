@@ -13,3 +13,11 @@ README*
 
 # Downloaded Instagram media
 downloads/
+
+*.db
+*.db-shm
+*.db-wal
+__pycache__
+*.pyc
+.venv
+X Twitter Multi Account Monitor + NAS Archive.json

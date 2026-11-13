@@ -1,0 +1,446 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { atomic, load, log } from './error-monitor.mjs';
+import { readSettings, settingsFile } from './telegram-settings.mjs';
+import { XArchive } from './x-archive.mjs';
+import { normalizeFxTimeline, normalizeFxPost, normalizeHistory, parseXLink, validXUsername } from './x-model.mjs';
+
+const hash = value => createHash('sha256').update(value).digest('hex');
+const eventKey = event => `${event.kind}:${event.statusId}`;
+const nextDay = now => new Date(now + 86400000).toISOString().slice(0,10);
+const day = now => new Date(now).toISOString().slice(0,10);
+const active = status => ['queued','working','importing','retry'].includes(status);
+const safeReason = error => /^[A-Z][A-Z0-9_]{1,90}$/.test(error?.message || '') ? error.message : 'X_OPERATION_FAILED';
+const pythonScript = name => fileURLToPath(new URL('../' + name, import.meta.url));
+
+// Every mutable queue has one writer: this process. Telegram owns settings.json.
+export class XWatcher {
+  constructor({ stateDir, root, settings, env = process.env, fetchImpl = fetch, archive, historyRunner }) {
+    Object.assign(this, { stateDir, root, settings, env, fetchImpl, historyRunner });
+    this.dir = path.join(stateDir,'x'); this.file = path.join(this.dir,'worker.json');
+    this.archive = archive || new XArchive({root,fetchImpl});
+    const interval = Number(env.X_CHECK_INTERVAL_SECONDS || 300);
+    if (!Number.isInteger(interval) || interval < 60 || interval > 86400) throw Error('X_INVALID_INTERVAL');
+    this.interval = interval * 1000;
+    if (fs.existsSync(this.file+'.required') && !fs.existsSync(this.file)) throw Error('X_WORKER_HISTORY_MISSING');
+    this.state = load(this.file,{version:1,accounts:{},history:{},requests:{},pool:{active:0,locked:0}});
+    if (this.state?.version !== 1 || !this.state.accounts || !this.state.history || !this.state.requests ||
+        [this.state.accounts,this.state.history,this.state.requests].some(v=>typeof v!=='object'||Array.isArray(v))) throw Error('X_WORKER_HISTORY_INVALID');
+    for (const [name,a] of Object.entries(this.state.accounts)) {
+      if (!validXUsername(name) || !a || typeof a.baseline!=='boolean' || !a.seen || !a.pending || !a.generations ||
+          [a.seen,a.pending,a.generations].some(v=>typeof v!=='object'||Array.isArray(v))) throw Error('X_WORKER_HISTORY_INVALID');
+    }
+    for (const [id,j] of Object.entries(this.state.history)) {
+      if (!/^[a-f0-9-]{36}$/.test(id) || !j || j.id!==id || !validXUsername(j.username) || !Array.isArray(j.requestIds) || !Array.isArray(j.userIds)) throw Error('X_WORKER_HISTORY_INVALID');
+      if (['working','importing'].includes(j.status)) j.status='queued';
+    }
+    this.persist();
+  }
+  persist() {
+    atomic(this.file,this.state);
+    if (!fs.existsSync(this.file+'.required')) fs.writeFileSync(this.file+'.required','required',{flag:'wx',mode:0o600});
+  }
+  subscriptions(name) {
+    const s=this.settings();
+    return s.allowedIds.flatMap(userId=>{
+      const sub=Object.hasOwn(s.users[userId]?.xTargets || {},name) ? s.users[userId].xTargets[name] : null;
+      return sub ? [{userId,sub}] : [];
+    });
+  }
+  names() {
+    const s=this.settings();
+    return [...new Set(s.allowedIds.flatMap(id=>Object.keys(s.users[id]?.xTargets || {})))].filter(validXUsername);
+  }
+  account(name) {
+    if(!validXUsername(name))throw Error('X_INVALID_USERNAME');
+    if(!Object.hasOwn(this.state.accounts,name))Object.defineProperty(this.state.accounts,name,{value:{baseline:false,seen:{},pending:{},generations:{},failures:0,nextAt:0,lastSuccess:0},enumerable:true,writable:true,configurable:true});
+    return this.state.accounts[name];
+  }
+  emit(event,identity) {
+    const id=hash(identity); atomic(path.join(this.dir,'events',id+'.json'),{version:1,id,...event});
+  }
+  notice(text,name,identity=randomUUID(),userIds) {
+    const ids=userIds || (name ? this.subscriptions(name).map(s=>s.userId) : [this.settings().ownerId]);
+    this.emit({type:'notice',at:Date.now(),...(name?{username:name}:{}),text,recipients:[...new Set(ids)].map(userId=>({userId}))},identity);
+  }
+  async json(url) {
+    let response;
+    try { response=await this.fetchImpl(url,{redirect:'error',headers:{Accept:'application/json','User-Agent':'ig-x-monitor/1.0'},signal:AbortSignal.timeout(30000)}); }
+    catch { throw Error('X_NETWORK_ERROR'); }
+    if (!response.ok) throw Error(`X_HTTP_${response.status}`);
+    const max=20_000_000;
+    if (Number(response.headers.get('content-length'))>max) throw Error('X_RESPONSE_TOO_LARGE');
+    const chunks=[]; let bytes=0;
+    for await (const chunk of response.body) { bytes+=chunk.length;if(bytes>max)throw Error('X_RESPONSE_TOO_LARGE');chunks.push(chunk); }
+    try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw Error('X_INVALID_RESPONSE'); }
+  }
+  enqueueHistory({username,start,end,userId,requestId,gap=false},now) {
+    // Share a running full-history job; narrower requests already fit its range.
+    let job=Object.values(this.state.history).find(j=>j.username===username && active(j.status) && !j.cancelRequested &&
+      ((!j.start || (start && j.start<=start)) && j.end >= (end || nextDay(now))));
+    if (!job) {
+      job={id:randomUUID(),username,...(start?{start}:{}),end:end||nextDay(now),at:now,status:'queued',requestIds:[],userIds:[],gap,attempts:0};
+      this.state.history[job.id]=job;
+    }
+    if(requestId&&!job.requestIds.includes(requestId))job.requestIds.push(requestId);
+    if(userId&&!job.userIds.includes(userId))job.userIds.push(userId);
+    if(gap)job.gap=true;
+    return job;
+  }
+  historyReport(job,now=Date.now()) {
+    let progress={};
+    try { progress=load(path.join(this.dir,'progress',job.id+'.json'),{}) || {}; }
+    catch { progress={stage:'progress_unavailable'}; }
+    const account=this.account(job.username);
+    let archive;
+    if(job.archiveKeysReady&&Array.isArray(job.archiveKeys)) {
+      const done=job.archiveKeys.filter(key=>account.seen[key]&&!account.pending[key]).length;
+      archive={total:job.archiveKeys.length,done,remaining:job.archiveKeys.length-done,
+        failed:job.archiveKeys.filter(key=>account.pending[key]?.failed).length,unit:'post'};
+    }
+    const terminal=['needs_start','failed','cancelled'].includes(job.status);
+    const phase=terminal?job.status:job.status==='retry'?'waiting':job.status==='queued'?'queued':
+      job.status==='importing'?'importing':job.reported?'finished':job.phase==='rendering'?'rendering':
+      job.fetchDone?'archive':progress.lastWorkStage||progress.phase||progress.stage;
+    return {version:1,id:job.id,username:job.username,status:job.status,at:now,requestedAt:job.at,start:job.start||progress.start,end:job.end,
+      reason:job.reason,retryAt:job.retryAt,posts:job.posts || progress.posts || 0,
+      phase,fetchDone:!!job.fetchDone,reported:!!job.reported,importedPosts:job.importedPosts,
+      progressUpdatedAt:job.fetchDone?(job.archiveUpdatedAt||progress.at):progress.at,archive,
+      progress:{completedWindows:progress.completedWindows??progress.window_status_counts?.done,
+        totalWindows:progress.totalWindows,remainingWindows:progress.remainingWindows,
+        partialWindows:progress.partialWindows??progress.window_status_counts?.partial,failedWindows:progress.failedWindows??progress.window_status_counts?.failed,
+        currentPass:progress.currentPass,windowStart:progress.windowStart,windowEnd:progress.windowEnd,lastWorkStage:progress.lastWorkStage,
+        passes:Array.isArray(progress.passes)?progress.passes.filter(item=>item&&typeof item==='object'&&!Array.isArray(item)).map(({name,total,completed,partial,failed})=>({name,total,completed,partial,failed})):undefined}};
+  }
+  writeJob(job,now=Date.now()) {
+    const report=this.historyReport(job,now);
+    for(const id of job.requestIds) atomic(path.join(this.dir,'jobs',id+'.json'),{...report,requestId:id});
+  }
+  syncRequests(now=Date.now()) {
+    const s=this.settings();
+    for(const r of Object.values(s.xRequests || {}).sort((a,b)=>a.at-b.at)) {
+      if(this.state.requests[r.id] || !s.allowedIds.includes(r.userId) || !validXUsername(r.username)) continue;
+      if(r.type==='history') {
+        if(!this.subscriptions(r.username).some(v=>v.userId===r.userId))continue;
+        if((r.end&&r.end>nextDay(now))||(r.start&&r.start>day(now))) {
+          this.state.requests[r.id]={status:'failed',reason:'X_INVALID_DATE_RANGE'};
+          this.notice('X 歷史回補日期不能超過申請當天。',null,`invalid-date:${r.id}`,[r.userId]);continue;
+        }
+        const job=this.enqueueHistory({...r,requestId:r.id},now);this.state.requests[r.id]={jobId:job.id};this.writeJob(job,now);
+      } else if(r.type==='manual') this.state.requests[r.id]={status:'queued',attempts:0};
+    }
+    this.persist();
+  }
+  async pollAccount(name,now) {
+    const a=this.account(name);if(now<a.nextAt)return;
+    // A stopped container cannot record fetch errors. Infer a gap from its checkpoint.
+    if(a.baseline&&a.lastSuccess&&now-a.lastSuccess>this.interval*2)a.gapStart ||= a.lastSuccess;
+    const subscribers=this.subscriptions(name);
+    try {
+      const payload=await this.json(`https://api.fxtwitter.com/2/profile/${name}/statuses?count=100&with_replies=1`);
+      const rows=normalizeFxTimeline(payload,name);
+      const oldGenerations={...a.generations};
+      // Snapshot the intent before archiving: interrupted downloads must not lose recipients.
+      for(const e of rows) {
+        const key=eventKey(e);if(a.seen[key])continue;
+        const recipients=a.baseline && !a.gapStart ? subscribers.filter(({userId,sub})=>oldGenerations[userId]===sub.generation &&
+          sub.notifications[e.kind]?.enabled && sub.notifications[e.kind].since<=now).map(({userId,sub})=>({userId,generation:sub.generation})) : [];
+        a.pending[key]={event:e,at:now,recipients};a.seen[key]=now;
+      }
+      for(const {userId,sub} of subscribers)a.generations[userId]=sub.generation;
+      for(const id of Object.keys(a.generations))if(!subscribers.some(s=>s.userId===id))delete a.generations[id];
+      if(a.gapStart) {
+        const job=this.enqueueHistory({username:name,start:day(a.gapStart),end:nextDay(now),gap:true},now);
+        job.userIds=[...new Set([...job.userIds,...subscribers.map(s=>s.userId)])];
+        this.notice(`X @${name} 監控已恢復；中斷期間已排入歷史補抓，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
+        delete a.gapStart;
+      }
+      a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;delete a.reason;
+      this.persist();
+    } catch(error) {
+      if(error.code)throw error;
+      a.failures++;a.reason=safeReason(error);
+      if(a.baseline) a.gapStart ||= a.lastSuccess;
+      a.nextAt=now+Math.min(3600000,this.interval*2**Math.min(a.failures,6));
+      if(a.failures===1)this.notice(`X @${name} 監控異常：${a.reason}。將退避重試。`,name,`${name}:fetch:${now}`);
+      this.persist();
+    }
+  }
+  async archivePending(now) {
+    // Fair across targets and failures; delayed entries do not consume the budget.
+    const candidates=this.names().flatMap(name=>Object.entries(this.account(name).pending).map(([key,p])=>({name,key,p})))
+      .filter(({p})=>now>=(p.retryAt||0)).sort((a,b)=>(a.p.lastAttempt||0)-(b.p.lastAttempt||0)||a.p.at-b.p.at).slice(0,5);
+    for(const {name,key,p} of candidates) {
+        const a=this.account(name);p.lastAttempt=now;
+        for(const job of Object.values(this.state.history))if(job.username===name&&job.archiveKeys?.includes(key))job.archiveUpdatedAt=now;
+        try {
+          const result=await this.archive.save(p.event);
+          if(result.errors?.length) throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');
+          if(p.recipients.length)this.emit({type:'post',username:name,kind:p.event.kind,statusId:p.event.statusId,publishedAt:p.event.publishedAt,at:p.at,recipients:p.recipients,result},`${name}:${key}:${p.at}`);
+          delete a.pending[key];
+          if(p.failed)this.notice(`X @${name} 貼文 ${p.event.statusId} 封存已恢復。`,name,`${name}:archive-recovery:${key}`);
+        } catch(error) {
+          p.retryAt=now+300000;
+          if(!p.failed)this.notice(`X @${name} 封存失敗：${safeReason(error)}。內容仍在佇列等待重試。`,name,`${name}:archive:${key}`);
+          p.failed=true;
+        }
+        this.persist();
+    }
+  }
+  async manualRequests(now) {
+    const s=this.settings();
+    for(const r of Object.values(s.xRequests || {})) {
+      const task=this.state.requests[r.id];
+      if(r.type!=='manual'||!task||!['queued','retry'].includes(task.status)||now<(task.retryAt||0)||!s.allowedIds.includes(r.userId))continue;
+      try {
+        const link=parseXLink(r.url);
+        if(link.kind!=='post'||link.username!==r.username)throw Error('X_INVALID_LINK');
+        const payload=await this.json(`https://api.fxtwitter.com/${link.username}/status/${link.statusId}`);
+        const e=normalizeFxPost(payload,link), result=await this.archive.save(e);
+        if(result.errors?.length)throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');
+        this.emit({type:'post',username:e.targetUsername,kind:e.kind,statusId:e.statusId,publishedAt:e.publishedAt,at:r.at,manual:true,requestId:r.id,userId:r.userId,recipients:[{userId:r.userId}],result},`manual:${r.id}`);
+        task.status='complete';
+      } catch(error) {
+        task.attempts++;task.reason=safeReason(error);task.retryAt=now+30000;
+        task.status=task.attempts>=3?'failed':'retry';
+        if(task.status==='failed')this.notice(`X 連結下載失敗：${task.reason}\n${r.url}`,null,`manual-failed:${r.id}`,[r.userId]);
+      }
+      atomic(path.join(this.dir,'jobs',r.id+'.json'),{...task,requestId:r.id,username:r.username,at:now});
+      this.persist();break;
+    }
+  }
+  async importHistory(name,records,now=Date.now(),keepGoing=()=>true,job=null) {
+    const a=this.account(name);let count=0;
+    const keys=new Set(job?.archiveKeys||[]);
+    if(job){job.archiveKeys=[...keys];job.archiveKeysReady=false;job.importedPosts=0;}
+    for await(const record of records) {
+      if(!keepGoing())throw Error('X_HISTORY_CANCELLED');
+      const e=normalizeHistory(record,name);if(!e)continue;
+      const key=eventKey(e);
+      // Existing daily intent wins: historical imports may never erase its recipients.
+      if(!a.seen[key]){a.seen[key]=now;a.pending[key]={event:e,at:now,recipients:[]};}
+      if(job&&!keys.has(key)){keys.add(key);job.archiveKeys.push(key);}
+      count++;if(job)job.importedPosts=count;
+      if(count%100===0){this.persist();if(job)this.writeJob(job);}
+    }
+    if(job){job.archiveKeysReady=true;job.archiveUpdatedAt=Date.now();}
+    this.persist();return count;
+  }
+  async hydrateArchiveProgress() {
+    for(const job of Object.values(this.state.history)) {
+      if(!job.fetchDone||job.reported||job.archiveKeysReady||job.archiveHydrationAttempted||!['complete','partial'].includes(job.status))continue;
+      job.archiveHydrationAttempted=true;
+      try {
+        const file=path.join(this.historyDirectory(job.username),`${job.username}_posts.jsonl`);
+        if(fs.lstatSync(file).isSymbolicLink())throw Error('X_UNSAFE_PATH');
+        const keys=new Set();
+        for await(const record of this.historyRecords(file))keys.add(eventKey(normalizeHistory(record,job.username)));
+        job.archiveKeys=[...keys];job.archiveKeysReady=true;
+      } catch(error) {job.progressError=safeReason(error);}
+      this.persist();this.writeJob(job);
+    }
+  }
+  async *historyRecords(file) {
+    const input=fs.createReadStream(file);const lines=readline.createInterface({input,crlfDelay:Infinity});
+    try { for await(const line of lines)if(line.trim())yield JSON.parse(line); }
+    finally { lines.close();input.destroy(); }
+  }
+  historyDirectory(name) {
+    if(!validXUsername(name)||!path.isAbsolute(this.root))throw Error('X_UNSAFE_PATH');
+    let current=this.root;
+    for(const part of ['', 'x',name]) {
+      if(part)current=path.join(current,part);
+      if(!fs.existsSync(current))fs.mkdirSync(current,{mode:0o700});
+      const st=fs.lstatSync(current);if(st.isSymbolicLink()||!st.isDirectory())throw Error('X_UNSAFE_PATH');
+    }
+    return current;
+  }
+  async runHistory(job) {
+    const out=this.historyDirectory(job.username), progress=path.join(this.dir,'progress',job.id+'.json');
+    const args=[pythonScript('x_history_worker.py'),'history','--username',job.username,'--out',out,'--accounts-db',this.env.X_ACCOUNTS_DB||'/app/x-accounts/accounts.db','--progress',progress,'--end',job.end,...(job.start?['--start',job.start]:[])];
+    if(this.historyRunner)return this.historyRunner(job,{out,progress,args});
+    await this.child(args,{allowedCodes:[0,1,2]});
+    const result=load(progress,null);
+    if(!result || !['complete','partial','needs_start','failed'].includes(result.status))throw Error('X_HISTORY_RESULT_MISSING');
+    return result;
+  }
+  child(args,{capture=false,allowedCodes=[0],track=true}={}) {
+    return new Promise((resolve,reject)=>{
+      const child=spawn('python3',args,{stdio:['ignore',capture?'pipe':'ignore','ignore']});
+      const field=track?'childProcess':'poolProcess';
+      this[field]=child;let output='';
+      if(capture)child.stdout.on('data',chunk=>{if(output.length<100000)output+=chunk;else child.kill('SIGTERM');});
+      child.on('error',()=>reject(Error('X_PYTHON_UNAVAILABLE')));
+      child.on('close',code=>{if(this[field]===child)this[field]=null;allowedCodes.includes(code)?resolve(output):reject(Error('X_HISTORY_PROCESS_FAILED'));});
+    });
+  }
+  historyAllowed(job) {
+    const ids=this.subscriptions(job.username).map(s=>s.userId);
+    return ids.length>0 && (job.gap || job.userIds.some(id=>ids.includes(id)));
+  }
+  cancelRevokedHistories() {
+    for(const job of Object.values(this.state.history))if(['working','importing'].includes(job.status)&&!this.historyAllowed(job)) {
+      job.cancelRequested=true;this.childProcess?.kill('SIGTERM');
+    }
+  }
+  startNextHistory(now) {
+    if(this.historyTask||this.stopping||this.env.X_HISTORY_ENABLED!=='1')return;
+    const job=Object.values(this.state.history).sort((a,b)=>a.at-b.at).find(j=>['queued','retry'].includes(j.status)&&now>=(j.retryAt||0));
+    if(!job)return;
+    if(job.cancelRequested||!this.historyAllowed(job)) {job.status='cancelled';this.persist();this.writeJob(job);return;}
+    if(this.state.pool.active>0&&this.state.pool.available===0&&this.state.pool.nextAvailableAt>now) {
+      job.status='retry';job.reason='X_NO_ACCOUNT_AVAILABLE';job.retryAt=this.state.pool.nextAvailableAt+1000;
+      this.persist();this.writeJob(job);return;
+    }
+    job.status='working';job.attempts++;this.persist();this.writeJob(job);
+    this.notice(`X @${job.username} 歷史回補已開始，可從帳號選單查看進度。`,job.username,`${job.id}:started`,job.userIds);
+    this.historyTask=(async()=>{
+      try {
+        const result=await this.runHistory(job);
+        if(job.cancelRequested||!this.historyAllowed(job))throw Error('X_HISTORY_CANCELLED');
+        if(result.status==='needs_start') {
+          job.status='needs_start';job.reason='X_START_DATE_REQUIRED';job.fetchDone=true;return;
+        }
+        if(result.status==='failed')throw Error(/^X_[A-Z0-9_]+$/.test(result.reason||'')?result.reason:'X_HISTORY_FAILED');
+        job.status='importing';this.persist();this.writeJob(job);
+        const file=path.join(this.historyDirectory(job.username),`${job.username}_posts.jsonl`);
+        const st=fs.lstatSync(file);if(st.isSymbolicLink()||!st.isFile())throw Error('X_UNSAFE_PATH');
+        job.posts=await this.importHistory(job.username,this.historyRecords(file),Date.now(),()=>!job.cancelRequested&&this.historyAllowed(job),job);
+        job.status=['complete','partial','needs_start','failed'].includes(result.status)?result.status:'partial';
+        job.start=result.start || job.start;
+        job.reason=result.reason;
+        job.fetchDone=true;
+        // Completion is sent only after the shared media queue has drained.
+      } catch(error) {
+        if(job.cancelRequested||error.message==='X_HISTORY_CANCELLED') {job.status='cancelled';return;}
+        if(this.stopping) {job.status='queued';job.attempts--;job.retryAt=0;return;}
+        const previous=job.reason;job.reason=safeReason(error);
+        // Rate locks/session refresh are waiting states, not exhausted scraping attempts.
+        if(job.reason==='X_NO_ACCOUNT_AVAILABLE') {job.attempts--;job.status='retry';}
+        else job.status=job.attempts<3?'retry':'failed';
+        job.retryAt=Date.now()+300000;
+        if(previous!==job.reason||job.status==='failed')this.notice(`X @${job.username} 歷史回補${job.status==='retry'?'暫停，稍後續跑':'失敗'}：${job.reason}`,job.username,`${job.id}:error:${job.attempts}`,job.userIds);
+      } finally {this.persist();this.writeJob(job);this.historyTask=null;}
+    })();
+  }
+  async renderHistory(job) {
+    const out=this.historyDirectory(job.username),media={};
+    const posts=path.join(out,'posts');
+    const byPath=new Map();
+    if(fs.existsSync(posts))for(const filename of fs.readdirSync(posts).filter(n=>/^[1-9]\d{0,24}\.json$/.test(n))) {
+      const file=path.join(posts,filename);if(fs.lstatSync(file).isSymbolicLink())throw Error('X_UNSAFE_PATH');
+      const record=load(file,null);
+      for(const item of record?.event?.media || []) {
+        const local=record.result?.files?.find(f=>path.basename(f.relativePath).startsWith(`${item.sourceId}_${String(item.index).padStart(2,'0')}.`));
+        if(!local)continue;
+        const entry={path:path.join(this.root,local.relativePath),kind:item.mediaType===2?'video':'image',error:null};
+        media[item.url]=entry;
+        try {const u=new URL(item.url);byPath.set(u.hostname+u.pathname,entry);}catch{/* Invalid source URLs never reach downloads. */}
+      }
+    }
+    const jsonl=path.join(out,`${job.username}_posts.jsonl`);
+    if(!fs.existsSync(jsonl))return;
+    // Existing extractor keys original URLs; name=orig is only a transfer choice.
+    const aliases=value=>{
+      if(typeof value==='string') {
+        try {const u=new URL(value),entry=byPath.get(u.hostname+u.pathname);if(entry)media[value]=entry;}catch{/* Non-URL post text. */}
+      } else if(Array.isArray(value))for(const child of value)aliases(child);
+      else if(value&&typeof value==='object')for(const child of Object.values(value))aliases(child);
+    };
+    for await(const record of this.historyRecords(jsonl))aliases(record.media),aliases(record.quoted_tweet),aliases(record.retweeted_tweet);
+    atomic(path.join(out,'media_manifest.json'),{media,generated_at:new Date().toISOString()});
+    await this.child([pythonScript('extract_x_archive.py'),out,'--render-only']);
+  }
+  async finishHistories() {
+    if(this.historyTask)return;
+    for(const job of Object.values(this.state.history)) {
+      if(!job.fetchDone||job.reported)continue;
+      const account=this.account(job.username);
+      const pending=job.archiveKeysReady&&Array.isArray(job.archiveKeys)
+        ?job.archiveKeys.some(key=>!account.seen[key]||account.pending[key]):Object.keys(account.pending).length>0;
+      if(pending)continue;
+      if(['complete','partial'].includes(job.status)&&this.env.X_HISTORY_ENABLED==='1') {
+        job.phase='rendering';job.archiveUpdatedAt=Date.now();this.writeJob(job);
+        try {await this.renderHistory(job);}
+        catch(error) {job.reason=safeReason(error);job.status='partial';}
+      }
+      const labels={complete:'搜尋流程已完成',partial:'部分完成，仍有未完成區段',needs_start:'無法取得建立日期，請用 /xhistory 指定起日',failed:'失敗'};
+      this.notice(`X @${job.username} 歷史回補：${labels[job.status]||job.status}；已匯入 ${job.posts||0} 篇並封存可取得的媒體。搜尋完成不代表歷史完整無缺。`,job.username,`${job.id}:result`,job.userIds);
+      job.reported=true;delete job.phase;this.persist();this.writeJob(job);
+    }
+  }
+  health(now=Date.now()) {
+    const running=Object.values(this.state.history).find(j=>['working','importing'].includes(j.status));
+    if(running)this.writeJob(running,now);
+    const data={at:now,enabled:true,phase:this.stopping?'stopped':'running',pool:this.state.pool,
+      targets:this.names().map(username=>{const a=this.account(username);return {username,failures:a.failures,reason:a.reason,pending:Object.keys(a.pending).length,saved:Object.keys(a.seen).length-Object.keys(a.pending).length,lastSuccess:a.lastSuccess};}),
+      history:running?{username:running.username,status:running.status}:null,
+      historyJobs:Object.values(this.state.history).sort((a,b)=>Number(active(b.status)||!!(b.fetchDone&&!b.reported))-Number(active(a.status)||!!(a.fetchDone&&!a.reported))||b.at-a.at).slice(0,50).map(job=>this.historyReport(job,now))};
+    atomic(path.join(this.dir,'health.json'),data);return data;
+  }
+  async refreshPool(now) {
+    if(this.stopping||this.env.X_HISTORY_ENABLED!=='1'||now<(this.state.poolNextAt||0))return;
+    try {
+      // Status reads use a separate handle so cancellation still targets the history job.
+      const output=await this.child([pythonScript('x_history_worker.py'),'status','--accounts-db',this.env.X_ACCOUNTS_DB||'/app/x-accounts/accounts.db'],{capture:true,track:false});
+      const pool=JSON.parse(output);
+      if(!Number.isInteger(pool.active)||!Number.isInteger(pool.locked)||pool.locked<0||pool.locked>pool.active)throw Error('X_POOL_INVALID');
+      const nextAvailableAt=Number.isFinite(pool.nextAvailableAt)&&pool.nextAvailableAt>now?pool.nextAvailableAt:null;
+      this.state.pool={active:pool.active,locked:pool.locked,available:pool.active-pool.locked,nextAvailableAt,checkedAt:now};
+      for(const job of Object.values(this.state.history)) {
+        if(job.status!=='retry'||job.reason!=='X_NO_ACCOUNT_AVAILABLE')continue;
+        if(this.state.pool.available>0)job.retryAt=now;
+        else if(nextAvailableAt)job.retryAt=nextAvailableAt+1000;
+        this.writeJob(job,now);
+      }
+      if(!pool.active&&!this.state.poolWarned){this.notice('X 歷史回補沒有可用登入帳號，請管理員在主機端更新 twscrape 帳號池。');this.state.poolWarned=true;}
+      if(pool.active&&this.state.poolWarned){this.notice('X 歷史回補帳號池已恢復可用。');this.state.poolWarned=false;}
+    } catch(error) {
+      if(this.stopping)return;
+      this.state.pool={active:0,locked:0,reason:safeReason(error)};
+      if(!this.state.poolWarned){this.notice('X 帳號池狀態讀取失敗，請管理員檢查 accounts.db。');this.state.poolWarned=true;}
+    }
+    this.state.poolNextAt=now+30000;this.persist();
+  }
+  async cycle(now=Date.now()) {
+    this.cancelRevokedHistories();
+    this.syncRequests(now);
+    await this.hydrateArchiveProgress();
+    await this.manualRequests(now);
+    for(const name of this.names())await this.pollAccount(name,now);
+    await this.archivePending(now);
+    await this.finishHistories();
+    await this.refreshPool(now);
+    this.startNextHistory(now);
+    this.health();
+  }
+  async stop() {
+    this.stopping=true;this.childProcess?.kill('SIGTERM');this.poolProcess?.kill('SIGTERM');
+    if(this.historyTask)await this.historyTask;
+    this.health();
+  }
+}
+
+export async function run({env=process.env,args=process.argv}={}) {
+  const stateDir=env.IG_STATE_DIR||'/app/state',root=env.IG_ARCHIVE_DIR||'/downloads';
+  if(env.X_ENABLED==='0'||env.IG_TELEGRAM_CONTROL==='0') {
+    const health=()=>atomic(path.join(stateDir,'x/health.json'),{at:Date.now(),enabled:false,phase:'disabled',targets:[]});
+    health();if(args.includes('--once'))return;
+    await new Promise(resolve=>{const tick=setInterval(health,15000);const stop=()=>{clearInterval(tick);for(const s of ['SIGTERM','SIGINT'])process.off(s,stop);resolve();};for(const s of ['SIGTERM','SIGINT'])process.on(s,stop);});
+    return;
+  }
+  const watcher=new XWatcher({stateDir,root,env,settings:()=>readSettings(settingsFile(env))});
+  log('X_WATCH_STARTED',{intervalSeconds:watcher.interval/1000,historyEnabled:env.X_HISTORY_ENABLED==='1'});
+  let stopping=false;
+  const stop=()=>{stopping=true;watcher.stopping=true;watcher.childProcess?.kill('SIGTERM');watcher.poolProcess?.kill('SIGTERM');};
+  for(const signal of ['SIGINT','SIGTERM'])process.on(signal,stop);
+  const heartbeat=setInterval(()=>{try{watcher.health();}catch{stop();}},15000);
+  try {
+    do {await watcher.cycle();if(!args.includes('--once'))await new Promise(r=>setTimeout(r,1000));}while(!stopping&&!args.includes('--once'));
+  } finally {clearInterval(heartbeat);await watcher.stop();for(const signal of ['SIGINT','SIGTERM'])process.off(signal,stop);}
+}
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)run().catch(error=>{log('X_WATCH_FATAL',{reason:safeReason(error)});process.exitCode=1;});

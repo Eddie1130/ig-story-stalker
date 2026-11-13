@@ -133,6 +133,8 @@ alerts can also migrate and recover under the correct account identity.
 
 ## Requirements
 
+X／Twitter 功能、帳號池設定與升級步驟請見 [X 整合說明](docs/x-integration.md)。
+
 - Docker Engine with Docker Compose v2
 - A Telegram bot token and destination chat ID
 - The target accounts' Instagram usernames
@@ -222,6 +224,15 @@ The test sends a text message only. It does not fetch or deliver a Story.
 ./igctl ps
 ./igctl logs -f ig-watch ig-watchdog ig-telegram
 ```
+
+要啟用 X／Twitter 監控與歷史回補，還必須啟動 X worker：
+
+```sh
+./igctl up -d x-watch
+```
+
+只啟動上面的三個 IG／Telegram 服務，回補申請會一直顯示「等待排入佇列」。
+歷史回補還需要有效的 twscrape `accounts.db`；設定方式見 [X 整合說明](docs/x-integration.md)。
 
 Stop all monitoring services with:
 

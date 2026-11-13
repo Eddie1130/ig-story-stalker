@@ -21,8 +21,8 @@ export function albumPlan(files) {
   flush(); return { groups, oversized };
 }
 export class ManualDelivery {
-  constructor({ root, dir, stateDir, settings, log = () => {}, probe = videoAttributes, preview = videoPreview }) {
-    Object.assign(this, { root, dir, stateDir, settings, log, probe, preview });
+  constructor({ root, dir, stateDir, settings, log = () => {}, probe = videoAttributes, preview = videoPreview, fileResolver = validManualFile }) {
+    Object.assign(this, { root, dir, stateDir, settings, log, probe, preview, fileResolver });
     this.file = path.join(dir, 'manual-delivery.json');
     if (fs.existsSync(this.file + '.required') && !fs.existsSync(this.file)) throw Error('MANUAL_DELIVERY_HISTORY_MISSING');
     this.state = load(this.file, { version: 1, jobs: {} });
@@ -108,7 +108,7 @@ export class ManualDelivery {
   }
   async upload(group, result, userId, documents) {
     const files = [], media = [];
-    const filenames = group.map(file => validManualFile(this.root, file));
+    const filenames = group.map(file => this.fileResolver(this.root, file));
     const attributes = [], previews = [];
     if (!documents) {
       for (let i = 0; i < group.length; i++) {
