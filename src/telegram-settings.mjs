@@ -4,6 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomic, load } from './error-monitor.mjs';
 import { configuredTargets } from './target-config.mjs';
+import { validateTikTokSettings, seedTikTok } from './tiktok-settings.mjs';
 import { validateXSettings, configuredXTargets } from './x-settings.mjs';
 
 export const kinds = ['story', 'post', 'highlight'];
@@ -39,6 +40,7 @@ export function validateSettings(s) {
   }
   for (const [name, id] of Object.entries(s.legacyIds)) if (!validUsername(name) || !/^\d+$/.test(id)) throw Error('TELEGRAM_SETTINGS_INVALID');
   validateXSettings(s);
+  validateTikTokSettings(s);
   return s;
 }
 export function readSettings(file) {
@@ -64,6 +66,7 @@ export function initializeSettings(env, now = Date.now()) {
     s.allowedIds = allowedIds;
   }
   for (const id of allowedIds) s.users[id] ||= { daily: false, targets: {} };
+  seedTikTok(s, env, now);
   atomic(file, validateSettings(s));
   if (!fs.existsSync(required)) fs.writeFileSync(required, 'required', { mode: 0o600, flag: 'wx' });
   return s;

@@ -1,3 +1,4 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 import { sendControlFallback } from './telegram-fallback.mjs';
 import { controlEnabled, readSettings, settingsFile } from './telegram-settings.mjs';
 import { publishEvent, eventDirectory, controlHeartbeat } from './telegram-events.mjs';
@@ -103,7 +104,7 @@ async function main() {
         continue;
       }
       try {
-        const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        const r = await fetch(`${telegramApiBase()}/bot${token}/sendMessage`, {
           method: 'POST', signal: AbortSignal.any([abort.signal, AbortSignal.timeout(20000)]),
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text: alert.text, link_preview_options: { is_disabled: true } }),

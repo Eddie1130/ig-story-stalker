@@ -1,0 +1,84 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:10.3
+    env_file: [.env.tiktok]
+    environment:
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "1"
+    volumes:
+      - telegram-local-data:/var/lib/telegram-bot-api
+      - ${IG_DOWNLOAD_DIR:-./downloads}:/downloads:ro
+    restart: unless-stopped
+
+  tiktok-vpn:
+    image: qmcgaw/gluetun:latest
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    env_file: [.env.tiktok]
+    environment:
+      VPN_SERVICE_PROVIDER: surfshark
+      VPN_TYPE: openvpn
+    restart: unless-stopped
+
+  tiktok-browser-resolver:
+    build: ./tiktok/browser-resolver
+    network_mode: service:tiktok-vpn
+    depends_on: [tiktok-vpn]
+    environment:
+      TIKTOK_COOKIE_FILE: /app/cookies.json
+      BROWSER_PROFILE_DIR: /data/profile
+      RESOLVER_BIND: 127.0.0.1
+      RESOLVER_PORT: "8787"
+    volumes:
+      - ./data/tiktok/cookies.json:/app/cookies.json:ro
+      - tiktok-browser-profile:/data/profile
+    shm_size: 512mb
+    restart: unless-stopped
+
+  tiktok-watch:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.tiktok
+    init: true
+    network_mode: service:tiktok-vpn
+    depends_on:
+      tiktok-vpn:
+        condition: service_started
+      tiktok-browser-resolver:
+        condition: service_started
+      ig-telegram:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Tokyo
+      TIKTOK_BROWSER_RESOLVER_URL: http://127.0.0.1:8787
+      TIKTOK_COOKIE_FILE: /app/cookies.json
+      IG_TELEGRAM_CONTROL: ${IG_TELEGRAM_CONTROL:-1}
+    volumes:
+      - ./data/tiktok/cookies.json:/app/cookies.json:ro
+      - ${IG_DATA_DIR:-./data}/control:/app/control:ro
+      - ${IG_DATA_DIR:-./data}/watch:/app/state
+      - ${IG_DOWNLOAD_DIR:-./downloads}:/downloads
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: [CMD, python, -c, "import json,time; h=json.load(open('/app/state/tiktok/health.json')); assert time.time()*1000-h['at']<120000 and h.get('phase')!='stopped'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ig-telegram:
+    environment:
+      TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+      TIKTOK_TARGET_USERNAMES: ${TIKTOK_TARGET_USERNAMES:-}
+    depends_on: [telegram-bot-api]
+  ig-watch:
+    environment:
+      TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+  ig-watchdog:
+    environment:
+      TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+
+volumes:
+  telegram-local-data:
+  tiktok-browser-profile:

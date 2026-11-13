@@ -1,3 +1,5 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
+import { TikTokDelivery } from './tiktok-delivery.mjs';
 import { ManualDelivery } from './manual-delivery.mjs';
 import { flushReplies } from './telegram-replies.mjs';
 import fs from 'node:fs';
@@ -66,6 +68,13 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
     reports.sort((a, b) => priority(a) - priority(b) || requestedAt(b) - requestedAt(a));
     for (const [index, job] of reports.slice(0, 5).entries()) lines.push(index < 2 ? formatXHistory(job) : compactXHistory(job));
   }
+  const ttNames = Object.keys(user?.tiktokTargets || {});
+  if (ttNames.length) {
+    const h = read(path.join(stateDir, "tiktok/health.json"), null);
+    lines.push("", "🎬 TikTok LIVE");
+    for (const name of ttNames) lines.push(`@${name}：${h?.targets?.[name]?.phase || "等待首次檢查"}`);
+    if (!h || Date.now() - h.at > 120000) lines.push("TikTok worker 心跳過期或尚未啟動。");
+  }
   const issues = { ...read(path.join(stateDir, 'monitor/issues.json'), {}), ...(watchdogDir ? read(path.join(watchdogDir, 'issues.json'), {}) : {}) };
   const targetIds = new Set(targets.filter(t => t && names.includes(t.username)).map(t => t.target));
   const relevant = Object.entries(issues).filter(([key, v]) => v?.active && (!key.startsWith('target:') || targetIds.has(v.target) || v.usernames?.some(name => names.includes(name)) || names.some(name => key.startsWith(`target:${name}:`))));
@@ -95,19 +104,21 @@ export async function run({ env = process.env, args = process.argv } = {}) {
   const stop = () => { stopping = true; signal.abort(); };
   for (const name of ['SIGTERM', 'SIGINT']) process.on(name, stop);
   const wait = ms => new Promise(resolve => { const t = setTimeout(done, ms); function done() { clearTimeout(t); signal.signal.removeEventListener('abort', done); resolve(); } signal.signal.addEventListener('abort', done, { once: true }); if (stopping) done(); });
-  const client = new TelegramClient({ token: env.TELEGRAM_BOT_TOKEN, dir, signal: signal.signal, sleep: wait });
+  const client = new TelegramClient({ token: env.TELEGRAM_BOT_TOKEN, baseUrl: telegramApiBase(env), dir, signal: signal.signal, sleep: wait });
   const delivery = new PersonalDelivery({ dir, stateDir, settings: () => settings, log });
   const manual = new ManualDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
   const xDelivery = env.X_ENABLED === '0' ? null : new XDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
+  const ttDelivery = new TikTokDelivery({ root: env.IG_ARCHIVE_DIR || "/downloads", dir, stateDir, settings: () => settings, log });
+  const ttOk = { video: true, notice: true };
   const persistSettings = () => atomic(settingsFile(env), settings);
   const describe = id => describeUser(settings, id, stateDir, env.IG_WATCHDOG_DIR || '/app/watchdog-state');
-  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
+  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk && ttOk.video && ttOk.notice, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
   const heartbeat = setInterval(health, 15000);
   try {
     // Do not silently delete another deployment's webhook or pending updates.
     const webhook = await client.call('getWebhookInfo', {}, { polling: true });
     if (webhook?.url) throw Error('TELEGRAM_WEBHOOK_CONFIGURED');
-    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
+    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'ttadd', description: '新增 TikTok LIVE 帳號，例如 /ttadd alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
     await client.call('setChatMenuButton', { menu_button: { type: 'commands' } });
     health(); log('TELEGRAM_CONTROL_STARTED');
     async function poll() {
@@ -156,8 +167,14 @@ export async function run({ env = process.env, args = process.argv } = {}) {
         if (!args.includes('--once')) await wait(1000);
       } while (!stopping && !args.includes('--once'));
     }
-    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch()]);
-    if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk ? 0 : 1;
+    async function tikTokDispatch(lane) {
+      do {
+        ttOk[lane] = await ttDelivery.drain(client, { stopping: () => stopping, lane });
+        if (!args.includes("--once")) await wait(1000);
+      } while (!stopping && !args.includes("--once"));
+    }
+    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch(), tikTokDispatch('notice'), tikTokDispatch('video')]);
+    if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk && ttOk.video && ttOk.notice ? 0 : 1;
   } finally {
     stopping = true; signal.abort(); clearInterval(heartbeat);
     for (const name of ['SIGTERM', 'SIGINT']) process.off(name, stop);

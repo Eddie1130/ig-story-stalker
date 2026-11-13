@@ -98,7 +98,7 @@ export class XDelivery {
   }
   async send(client, entry, method, body, files, expectedCount, eligible) {
     try {
-      const response = await client.call(method, body, { files, timeoutMs: files?.length ? 180000 : undefined,
+      const response = await client.call(method, body, { files, timeoutMs: this.uploadTimeoutMs || (files?.length ? client.baseUrl && client.baseUrl !== 'https://api.telegram.org' ? 3600000 : 180000 : undefined),
         beforeRequest: () => {
           if (!eligible()) throw Error('X_DELIVERY_CANCELLED');
           entry.inflight = { at: Date.now() }; this.persist();

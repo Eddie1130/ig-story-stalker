@@ -1,3 +1,4 @@
+import { tikTokCallback, tikTokMessage } from './tiktok-menu.mjs';
 import { instagramLinks } from './instagram-links.mjs';
 import { kinds, validUsername, userTarget, put } from './telegram-settings.mjs';
 import { subscription } from './telegram-settings.mjs';
@@ -8,9 +9,10 @@ const button = (text, callback_data) => ({ text, callback_data });
 const panel = (text, rows) => ({ text, reply_markup: { inline_keyboard: rows } });
 const back = [button('⬅️ 主選單', 'menu')];
 export function mainMenu(user) {
-  return panel('Instagram／X 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
+  return panel('Instagram／X／TikTok 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
     [button('📷 Instagram', 'ig:menu'), button('𝕏 X / Twitter', 'x:menu')],
     [button('👥 監看帳號', 'list:0'), button('➕ 新增帳號', 'add')],
+    [button('🎬 TikTok LIVE', 'tt:menu')],
     [button('🔔 媒體通知', 'list:0')],
     [button(`📋 每日摘要：${user.daily ? '開啟' : '關閉'}`, `daily:${user.daily ? 0 : 1}`)],
     [button('🔗 連結下載', 'download')],
@@ -52,7 +54,8 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     settings.replies[`ack:${update.update_id}`] = { method: 'answerCallbackQuery', body: { callback_query_id: callback.id }, userId: id, at: now };
     const parts = String(callback.data || '').split(':');
     const [action, name, kind, value, generation] = parts;
-    if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
+    if (action === 'tt') result = tikTokCallback(user, callback.data, now);
+    else if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
     else if (action === 'menu' || (action === 'ig' && name === 'menu')) { delete user.waiting; result = mainMenu(user); }
     else if (action === 'list' && /^\d{1,5}$/.test(name)) result = listMenu(user, Number(name));
     else if (action === 'account' && validUsername(name)) result = accountMenu(user, name);
@@ -83,6 +86,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     if (totalLinks > 10) result = panel('每則訊息最多 10 個連結，請分批傳送。', [back]);
     else if (/^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text)) { delete user.waiting; result = mainMenu(user); }
     else if (/^\/status$/.test(text)) result = panel(statusText(id), [[button('🔄 重新整理', 'status')], back]);
+    else if (user.waiting === 'tt:add' || /^\/ttadd\s+/.test(text)) result = tikTokMessage(user, text, now);
     else if (xResult && !hasInstagramLinks(linkedText)) result = xResult;
     else if (/https?:\/\/|(?:^|\s)(?:www\.|m\.)?instagram\.com\//i.test(linkedText)) {
       try {

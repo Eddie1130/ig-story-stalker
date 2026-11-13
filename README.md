@@ -137,6 +137,8 @@ files. Resolve the reported layout conflict using your backup before retrying.
 Keep the old account configured during the upgrade so its outstanding supervisor
 alerts can also migrate and recover under the correct account identity.
 
+TikTok LIVE 多帳號錄影、共用 Local Bot API 與首次切換步驟請見 [TikTok 整合說明](docs/tiktok-integration.md)。
+
 ## Requirements
 
 X／Twitter 功能、帳號池設定與升級步驟請見 [X 整合說明](docs/x-integration.md)。

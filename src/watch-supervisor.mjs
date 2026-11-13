@@ -1,3 +1,4 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 import { targetIssueKey } from './targets.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -50,7 +51,7 @@ async function main() {
       if (peerAlerted || Date.now() - peerAttemptAt < 60000) return;
       peerAttemptAt = Date.now();
       try {
-        const r = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        const r = await fetch(`${telegramApiBase()}/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: 'POST', signal: AbortSignal.timeout(20000), headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID,
             text: `IG watchdog 心跳已中斷：@${target}\n這則備援警報由主監控直接發出。請檢查 ig-watchdog 容器。` }),

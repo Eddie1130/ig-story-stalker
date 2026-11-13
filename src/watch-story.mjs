@@ -1,3 +1,4 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 import { ensureTargetUserId } from './target-user.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -106,7 +107,7 @@ async function main() {
     lastSendAt = Date.now();
     let response, data;
     try {
-      response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      response = await fetch(`${telegramApiBase()}/bot${token}/sendMessage`, {
         method: 'POST', signal: AbortSignal.timeout(20000),
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text, link_preview_options: { is_disabled: true } }),

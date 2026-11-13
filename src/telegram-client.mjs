@@ -1,10 +1,11 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 import path from 'node:path';
 import { atomic, load } from './error-monitor.mjs';
 
 export class TelegramClient {
-  constructor({ token, dir, signal, fetchImpl = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+  constructor({ token, dir, signal, fetchImpl = fetch, baseUrl = telegramApiBase(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
     if (!/^\d+:[A-Za-z0-9_-]+$/.test(token || '')) throw Error('INVALID_TELEGRAM_CONFIG');
-    Object.assign(this, { token, signal, fetchImpl, sleep });
+    Object.assign(this, { token, signal, fetchImpl, sleep, baseUrl });
     this.file = path.join(dir, 'api-rate.json');
     this.rate = load(this.file, { retryAt: 0 });
     if (!Number.isFinite(this.rate.retryAt) || this.rate.retryAt < 0) throw Error('INVALID_TELEGRAM_RATE_STATE');
@@ -31,9 +32,9 @@ export class TelegramClient {
     beforeRequest?.();
     let response, data;
     try {
-      response = await this.fetchImpl(`https://api.telegram.org/bot${this.token}/${method}`, {
+      response = await this.fetchImpl(`${this.baseUrl}/bot${this.token}/${method}`, {
         method: 'POST', headers, body: payload,
-        signal: AbortSignal.any([...(this.signal ? [this.signal] : []), AbortSignal.timeout(timeoutMs || (polling ? 25000 : 20000))]),
+        signal: AbortSignal.any([...(this.signal ? [this.signal] : []), AbortSignal.timeout(timeoutMs || (polling ? 25000 : (files.length || /file:\/\//.test(JSON.stringify(body))) && this.baseUrl !== 'https://api.telegram.org' ? 3600000 : 20000))]),
       });
       data = await response.json();
     } catch { throw Error('TELEGRAM_NETWORK_OR_RESPONSE_ERROR'); }

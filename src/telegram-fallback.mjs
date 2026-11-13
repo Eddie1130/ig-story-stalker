@@ -1,3 +1,4 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 // Independent watchdog path: a blocked recipient must not suppress other users.
 export async function sendControlFallback({ recipients, state, token, signal, persist, log, fetchImpl = fetch }) {
   state.controlFallbackSent ||= {};
@@ -12,7 +13,7 @@ export async function sendControlFallback({ recipients, state, token, signal, pe
     // Only network/response work belongs in this catch. Persistence failures must
     // escape, including after Telegram has acknowledged a successful send.
     try {
-      const response = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
+      const response = await fetchImpl(`${telegramApiBase()}/bot${token}/sendMessage`, {
         method: 'POST', signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]),
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ chat_id: id, text: 'IG Telegram 控制服務已失聯，選單與通知可能暫停。獨立 watchdog 仍在運作，請檢查 ig-telegram 容器。' }),

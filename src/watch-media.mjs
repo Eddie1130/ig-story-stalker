@@ -1,3 +1,4 @@
+import { telegramApiBase } from './telegram-endpoint.mjs';
 import { ManualJobs } from './manual-jobs.mjs';
 import { controlEnabled, readSettings, settingsFile, targetConfigs } from './telegram-settings.mjs';
 import { notificationPublisher } from './telegram-events.mjs';
@@ -53,7 +54,7 @@ export async function main({ env = process.env, args = process.argv, dir = '/app
     lastSendAt = Date.now();
     let response, data;
     try {
-      response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      response = await fetch(`${telegramApiBase()}/bot${token}/${method}`, {
         method: 'POST', signal: AbortSignal.any([aborter.signal, AbortSignal.timeout(120000)]),
         headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, chat_id: chatId }),
       });

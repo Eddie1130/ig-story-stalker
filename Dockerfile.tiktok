@@ -1,0 +1,8 @@
+# Preserve the source project's upstream runtime and override layout.
+FROM michele0303/tiktok-live-recorder:develop@sha256:c4ff00a16d4469f391907aae0827ba55c3f8763a59b6a1c2461e8a66e46ed145
+USER root
+COPY tiktok/vendor/tiktok_api.py /app/core/tiktok_api.py
+COPY tiktok/vendor/tiktok_recorder.py /app/core/tiktok_recorder.py
+COPY tiktok/worker.py /app/integration_worker.py
+WORKDIR /app
+ENTRYPOINT ["python", "/app/integration_worker.py"]

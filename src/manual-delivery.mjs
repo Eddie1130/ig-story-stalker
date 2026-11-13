@@ -1,3 +1,4 @@
+import { telegramFileLimit } from './telegram-endpoint.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomic, load } from './error-monitor.mjs';
@@ -6,12 +7,12 @@ import { jobFile } from './manual-jobs.mjs';
 import { videoAttributes, videoPreview } from './video-attributes.mjs';
 
 export const CLOUD_FILE_LIMIT = 50_000_000;
-export function albumPlan(files) {
+export function albumPlan(files, limit = telegramFileLimit()) {
   const groups = [], oversized = [];
   let current = [];
   const flush = () => { if (current.length) groups.push(current); current = []; };
   for (const file of files) {
-    if (file.bytes > CLOUD_FILE_LIMIT) { flush(); oversized.push(file); continue; }
+    if (file.bytes > limit) { flush(); oversized.push(file); continue; }
     const ratio = file.width && file.height ? Math.max(file.width/file.height,file.height/file.width) : 1;
     const type = file.mediaType === 2 ? 'video' : file.bytes > 10_000_000 || Number(file.width || 0)+Number(file.height || 0)>10000 || ratio>20 ? 'document' : 'photo';
     if (current.length && ((current[0].type === 'document') !== (type === 'document'))) flush();
@@ -66,7 +67,7 @@ export class ManualDelivery {
             entry.localError = /^MANUAL_[A-Z0-9_]+$/.test(error.message) ? error.message : 'MANUAL_LOCAL_FILE_UNAVAILABLE'; this.persist(); break;
           }
           try {
-            const response = await client.call(upload.method, upload.body, { files: upload.files, timeoutMs: 180000,
+            const response = await client.call(upload.method, upload.body, { files: upload.files, timeoutMs: client.baseUrl && client.baseUrl !== 'https://api.telegram.org' ? 3600000 : 180000,
               beforeRequest: () => { entry.inflight = { group: entry.next, at: Date.now() }; this.persist(); } });
             const receipts = Array.isArray(response) ? response : [response];
             if (receipts.length !== group.length || receipts.some(r => !Number.isSafeInteger(r?.message_id))) throw Error('MANUAL_DELIVERY_UNCERTAIN');

@@ -30,3 +30,4 @@ __pycache__/
 .venv/
 # Original n8n export contains private deployment credentials.
 X Twitter Multi Account Monitor + NAS Archive.json
+!.env.tiktok.example
