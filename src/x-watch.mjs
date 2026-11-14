@@ -7,6 +7,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { atomic, load, log } from './error-monitor.mjs';
 import { readSettings, settingsFile } from './telegram-settings.mjs';
 import { XArchive } from './x-archive.mjs';
+import { XPendingStore, syncDirectory } from './x-pending-store.mjs';
 import { normalizeFxTimeline, normalizeFxPost, normalizeHistory, parseXLink, validXUsername } from './x-model.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -27,9 +28,12 @@ export class XWatcher {
     const interval = Number(env.X_CHECK_INTERVAL_SECONDS || 300);
     if (!Number.isInteger(interval) || interval < 60 || interval > 86400) throw Error('X_INVALID_INTERVAL');
     this.interval = interval * 1000;
+    const tick=Number(env.X_WORK_INTERVAL_SECONDS||5);
+    if(!Number.isInteger(tick)||tick<1||tick>60)throw Error('X_INVALID_WORK_INTERVAL');
+    this.workInterval=tick*1000;
     if (fs.existsSync(this.file+'.required') && !fs.existsSync(this.file)) throw Error('X_WORKER_HISTORY_MISSING');
     this.state = load(this.file,{version:1,accounts:{},history:{},requests:{},pool:{active:0,locked:0}});
-    if (this.state?.version !== 1 || !this.state.accounts || !this.state.history || !this.state.requests ||
+    if (![1,2].includes(this.state?.version) || !this.state.accounts || !this.state.history || !this.state.requests ||
         [this.state.accounts,this.state.history,this.state.requests].some(v=>typeof v!=='object'||Array.isArray(v))) throw Error('X_WORKER_HISTORY_INVALID');
     for (const [name,a] of Object.entries(this.state.accounts)) {
       if (!validXUsername(name) || !a || typeof a.baseline!=='boolean' || !a.seen || !a.pending || !a.generations ||
@@ -39,10 +43,25 @@ export class XWatcher {
       if (!/^[a-f0-9-]{36}$/.test(id) || !j || j.id!==id || !validXUsername(j.username) || !Array.isArray(j.requestIds) || !Array.isArray(j.userIds)) throw Error('X_WORKER_HISTORY_INVALID');
       if (['working','importing'].includes(j.status)) j.status='queued';
     }
+    this.pendingStore=new XPendingStore(path.join(this.dir,'pending'));
+    for(const [name,a] of Object.entries(this.state.accounts))for(const [key,p] of Object.entries(a.pending)) {
+      if(!p||typeof p!=='object'||Array.isArray(p))throw Error('X_WORKER_HISTORY_INVALID');
+      if(p.event) {
+        p.eventRef=this.pendingStore.put(name,key,p.event);
+        delete p.event;
+      } else this.pendingStore.file(p.eventRef);
+    }
+    this.state.version=2;
     this.persist();
+    this.pendingStore.collect(new Set(Object.values(this.state.accounts).flatMap(a=>Object.values(a.pending).map(p=>p.eventRef))));
+  }
+  pendingRecord(name,key,event,metadata) {
+    return {...metadata,eventRef:this.pendingStore.put(name,key,event)};
   }
   persist() {
+    this.pendingStore?.flush();
     atomic(this.file,this.state);
+    syncDirectory(this.dir);
     if (!fs.existsSync(this.file+'.required')) fs.writeFileSync(this.file+'.required','required',{flag:'wx',mode:0o600});
   }
   subscriptions(name) {
@@ -62,7 +81,9 @@ export class XWatcher {
     return this.state.accounts[name];
   }
   emit(event,identity) {
-    const id=hash(identity); atomic(path.join(this.dir,'events',id+'.json'),{version:1,id,...event});
+    const id=hash(identity),dir=path.join(this.dir,'events');
+    atomic(path.join(dir,id+'.json'),{version:1,id,...event});
+    syncDirectory(dir);syncDirectory(this.dir);
   }
   notice(text,name,identity=randomUUID(),userIds) {
     const ids=userIds || (name ? this.subscriptions(name).map(s=>s.userId) : [this.settings().ownerId]);
@@ -123,18 +144,20 @@ export class XWatcher {
   }
   syncRequests(now=Date.now()) {
     const s=this.settings();
+    let changed=false;
     for(const r of Object.values(s.xRequests || {}).sort((a,b)=>a.at-b.at)) {
       if(this.state.requests[r.id] || !s.allowedIds.includes(r.userId) || !validXUsername(r.username)) continue;
       if(r.type==='history') {
         if(!this.subscriptions(r.username).some(v=>v.userId===r.userId))continue;
+        changed=true;
         if((r.end&&r.end>nextDay(now))||(r.start&&r.start>day(now))) {
           this.state.requests[r.id]={status:'failed',reason:'X_INVALID_DATE_RANGE'};
           this.notice('X 歷史回補日期不能超過申請當天。',null,`invalid-date:${r.id}`,[r.userId]);continue;
         }
         const job=this.enqueueHistory({...r,requestId:r.id},now);this.state.requests[r.id]={jobId:job.id};this.writeJob(job,now);
-      } else if(r.type==='manual') this.state.requests[r.id]={status:'queued',attempts:0};
+      } else if(r.type==='manual') {this.state.requests[r.id]={status:'queued',attempts:0};changed=true;}
     }
-    this.persist();
+    if(changed)this.persist();
   }
   async pollAccount(name,now) {
     const a=this.account(name);if(now<a.nextAt)return;
@@ -162,7 +185,7 @@ export class XWatcher {
         const key=eventKey(e);if(a.seen[key])continue;
         const recipients=a.baseline && !a.gapStart ? subscribers.filter(({userId,sub})=>oldGenerations[userId]===sub.generation &&
           sub.notifications[e.kind]?.enabled && sub.notifications[e.kind].since<=now).map(({userId,sub})=>({userId,generation:sub.generation})) : [];
-        a.pending[key]={event:e,at:now,recipients};a.seen[key]=now;
+        a.pending[key]=this.pendingRecord(name,key,e,{at:now,recipients});a.seen[key]=now;
       }
       for(const {userId,sub} of subscribers)a.generations[userId]=sub.generation;
       for(const id of Object.keys(a.generations))if(!subscribers.some(s=>s.userId===id))delete a.generations[id];
@@ -227,14 +250,20 @@ export class XWatcher {
     const quiet=eligible.filter(({p})=>p.recipients.length===0);
     const liveCount=Math.min(live.length,quiet.length?4:5);
     const candidates=[...live.slice(0,liveCount),...quiet.slice(0,5-liveCount)];
+    const completed=[];let changed=false;
+    try {
     for(const {name,key,p} of candidates) {
+        if(this.stopping)break;
+        changed=true;
         const a=this.account(name);p.lastAttempt=now;
         for(const job of Object.values(this.state.history))if(job.username===name&&job.archiveKeys?.includes(key))job.archiveUpdatedAt=now;
         try {
-          const result=await this.archive.save(p.event);
+          const event=p.event||this.pendingStore.read(p.eventRef);
+          const result=await this.archive.save(event);
           if(result.errors?.length) throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');
-          if(p.recipients.length)this.emit({type:'post',username:name,kind:p.event.kind,statusId:p.event.statusId,publishedAt:p.event.publishedAt,at:p.at,recipients:p.recipients,result},`${name}:${key}:${p.at}`);
+          if(p.recipients.length)this.emit({type:'post',username:name,kind:event.kind,statusId:event.statusId,publishedAt:event.publishedAt,at:p.at,recipients:p.recipients,result},`${name}:${key}:${p.at}`);
           delete a.pending[key];
+          if(p.eventRef)completed.push(p.eventRef);
         } catch(error) {
           p.attempts=(p.attempts||0)+1;p.reason=safeReason(error);
           p.retryAt=now+300000;
@@ -246,7 +275,12 @@ export class XWatcher {
         if(a.archiveWarned&&!Object.values(a.pending).some(item=>item.failed)) {
           this.notice(`X @${name} 封存已恢復。`,name,`${name}:archive-recovery:${now}`);a.archiveWarned=false;
         }
-        this.persist();
+    }
+    } finally {
+      // A crash before this checkpoint replays at most five idempotent saves.
+      // Never unlink payloads until the durable queue no longer references them.
+      if(changed)this.persist();
+      for(const ref of completed)this.pendingStore.remove(ref);
     }
   }
   async retainLegacyManualRequests(now) {
@@ -303,7 +337,7 @@ export class XWatcher {
       const e=normalizeHistory(record,name);if(!e)continue;
       const key=eventKey(e);
       // Existing daily intent wins: historical imports may never erase its recipients.
-      if(!a.seen[key]){a.seen[key]=now;a.pending[key]={event:e,at:now,recipients:[]};}
+      if(!a.seen[key]){a.pending[key]=this.pendingRecord(name,key,e,{at:now,recipients:[]});a.seen[key]=now;}
       if(job&&!keys.has(key)){keys.add(key);job.archiveKeys.push(key);}
       count++;if(job)job.importedPosts=count;
       if(count%100===0){this.persist();if(job)this.writeJob(job);}
@@ -527,7 +561,7 @@ export async function run({env=process.env,args=process.argv}={}) {
   for(const signal of ['SIGINT','SIGTERM'])process.on(signal,stop);
   const heartbeat=setInterval(()=>{try{watcher.health();}catch{stop();}},15000);
   try {
-    do {await watcher.cycle();if(!args.includes('--once'))await new Promise(r=>setTimeout(r,1000));}while(!stopping&&!args.includes('--once'));
+    do {await watcher.cycle();if(!args.includes('--once')&&!stopping)await new Promise(r=>setTimeout(r,watcher.workInterval));}while(!stopping&&!args.includes('--once'));
   } finally {clearInterval(heartbeat);await watcher.stop();for(const signal of ['SIGINT','SIGTERM'])process.off(signal,stop);}
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)run().catch(error=>{log('X_WATCH_FATAL',{reason:safeReason(error)});process.exitCode=1;});

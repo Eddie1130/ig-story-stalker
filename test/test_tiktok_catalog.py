@@ -25,6 +25,99 @@ from catalog_media import delivery_parts
 
 
 class CatalogTests(unittest.TestCase):
+    def test_archived_payloads_are_not_loaded_for_idle_work_or_health(self):
+        record = {"username": "alice", "kind": "post", "status": "ready", "raw": "x" * 10000}
+        self.catalog.db.executemany(
+            "INSERT INTO items VALUES(?,?,?,?)",
+            [("123", "post", str(i), json.dumps(record)) for i in range(100)],
+        )
+        self.catalog.db.commit()
+        with patch("catalog_worker.json.loads", wraps=json.loads) as loads:
+            self.catalog.drain(self.settings)
+            self.catalog.repair(self.settings)
+            self.catalog.health()
+            self.assertEqual(loads.call_count, 0)
+
+    def test_reader_page_closes_restored_tabs_and_future_popups(self):
+        browser = BrowserTransport.__new__(BrowserTransport)
+        browser.context = Mock()
+        old = [Mock(), Mock(), Mock()]
+        current = browser.context.new_page.return_value
+        browser.context.pages = old + [current]
+        browser.prepare_reader_page()
+        for page in old:
+            page.close.assert_called_once()
+        current.close.assert_not_called()
+        popup = Mock()
+        callback = browser.context.on.call_args.args[1]
+        callback(popup)
+        popup.close.assert_called_once()
+        callback(current)
+        current.close.assert_not_called()
+
+    def test_reader_blocks_heavy_assets_but_keeps_scripts_and_catalog_api(self):
+        for resource, blocked in [("image", True), ("media", True), ("font", True), ("script", False), ("fetch", False)]:
+            route = Mock()
+            route.request = SimpleNamespace(method="GET", url="https://www.tiktok.com/asset", resource_type=resource)
+            BrowserTransport.guard(route)
+            self.assertEqual(route.abort.called, blocked)
+
+    def test_session_recycles_aged_browser_and_keeps_one_transport(self):
+        old, replacement = Mock(), Mock()
+        with patch("catalog_regular_browser.RegularBrowserTransport", side_effect=[old, replacement]) as launch, patch(
+            "catalog_worker.cookies", return_value={}
+        ), patch("catalog_provider.fetch_page", return_value={"items": []}), patch(
+            "catalog_worker.time.monotonic", side_effect=[10, 20, 3610, 3610]
+        ), patch.dict("os.environ", {"TIKTOK_CATALOG_BROWSER_MAX_AGE_SECONDS": "3600"}):
+            session = SessionProvider()
+            session("alice", "post")
+            session("alice", "repost")
+            self.assertEqual(launch.call_count, 1)
+            session("alice", "story")
+            old.close.assert_called_once()
+            self.assertIs(session.browser, replacement)
+            self.assertEqual(launch.call_count, 2)
+            session.close()
+
+    def test_reader_freezes_only_between_fetches_and_resumes_before_navigation(self):
+        browser = Mock()
+        operations = []
+        browser.resume.side_effect = lambda: operations.append("resume")
+        browser.pause.side_effect = lambda: operations.append("pause")
+        browser.navigate.side_effect = lambda name: operations.append("navigate")
+        with patch("catalog_regular_browser.RegularBrowserTransport", return_value=browser), patch(
+            "catalog_worker.cookies", return_value={}
+        ), patch("catalog_provider.fetch_page", side_effect=lambda *_: operations.append("fetch") or {"items": []}):
+            session = SessionProvider()
+            session("alice", "post")
+            session("bob", "story")
+        self.assertEqual(operations, ["fetch", "pause", "resume", "navigate", "fetch", "pause"])
+
+    def test_regular_page_lifecycle_freeze_can_be_resumed(self):
+        browser = RegularBrowserTransport.__new__(RegularBrowserTransport)
+        browser.lifecycle = Mock()
+        browser.pause()
+        browser.resume()
+        self.assertEqual(
+            [(c.args[0], c.args[1]) for c in browser.lifecycle.send.call_args_list],
+            [("Emulation.setScriptExecutionDisabled", {"value": True}), ("Emulation.setScriptExecutionDisabled", {"value": False})],
+        )
+
+    def test_idle_releases_renderer_once_then_reloads_target_for_next_work(self):
+        browser = Mock()
+        with patch("catalog_regular_browser.RegularBrowserTransport", return_value=browser), patch(
+            "catalog_worker.cookies", return_value={}
+        ), patch("catalog_provider.fetch_page", return_value={"items": []}):
+            session = SessionProvider()
+            session("alice", "post")
+            session.idle()
+            session.idle()
+            browser.park.assert_called_once()
+            self.assertIsNone(session.name)
+            session("alice", "story")
+            browser.navigate.assert_called_once_with("alice")
+            session.close()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -558,6 +651,7 @@ class ProviderTests(unittest.TestCase):
         browser = RegularBrowserTransport.__new__(RegularBrowserTransport)
         browser.context, browser.page = Mock(), Mock()
         cdp = browser.context.new_cdp_session.return_value
+        browser.lifecycle = cdp
 
         def registrations(event, handler):
             handler(
@@ -670,6 +764,7 @@ class ProviderTests(unittest.TestCase):
         factory, engine, context = Mock(), Mock(), Mock()
         factory.start.return_value = engine
         engine.chromium.launch_persistent_context.return_value = context
+        context.pages = []
         with tempfile.TemporaryDirectory() as folder:
             profile = Path(folder)
             values = {"example": "test-cookie-value"}

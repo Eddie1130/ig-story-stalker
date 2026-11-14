@@ -84,6 +84,10 @@ class SessionProvider:
         self.browser = None
         self.name = None
         self.manual_required = False
+        self.opened_at = None
+        self.max_age = int(os.getenv("TIKTOK_CATALOG_BROWSER_MAX_AGE_SECONDS", "3600"))
+        if self.max_age != 0 and not 300 <= self.max_age <= 86400:
+            raise ValueError("TIKTOK_INVALID_BROWSER_MAX_AGE")
 
     def __call__(self, name, kind, cursor="0", item_id=None):
         if os.getenv("TIKTOK_CATALOG_BROWSER", "1") != "1":
@@ -94,13 +98,18 @@ class SessionProvider:
         from catalog_provider import fetch_page
 
         try:
+            if self.browser and self.max_age and time.monotonic() - self.opened_at >= self.max_age:
+                self.close()
             if self.browser is None:
                 self.browser = RegularBrowserTransport(name, cookies())
                 self.name = name
-            elif self.name != name or kind == "profile":
-                self.name = None
-                self.browser.navigate(name)
-                self.name = name
+                self.opened_at = time.monotonic()
+            else:
+                self.browser.resume()
+                if self.name != name or kind == "profile":
+                    self.name = None
+                    self.browser.navigate(name)
+                    self.name = name
             request = {
                 "username": name,
                 "kind": kind,
@@ -134,11 +143,31 @@ class SessionProvider:
                         self.browser = self.name = None
                     raise RuntimeError("TIKTOK_BROWSER_TRANSPORT_FAILED") from None
             raise
+        finally:
+            if self.browser:
+                if self.manual_required:
+                    self.close()
+                else:
+                    try:
+                        self.browser.pause()
+                    except Exception:
+                        self.close()
+                        raise RuntimeError("TIKTOK_BROWSER_TRANSPORT_FAILED") from None
+
+    def idle(self):
+        if self.browser and self.name is not None:
+            self.name = None
+            try:
+                self.browser.park()
+            except Exception:
+                self.close()
+                raise RuntimeError("TIKTOK_BROWSER_TRANSPORT_FAILED") from None
 
     def close(self):
         if self.browser:
             self.browser.close()
             self.browser = None
+        self.name = self.opened_at = None
 
 
 def safe_file(root, relative):
@@ -265,6 +294,10 @@ class Catalog:
           CREATE TABLE IF NOT EXISTS streams(name TEXT, kind TEXT, data TEXT NOT NULL, PRIMARY KEY(name,kind));
           CREATE TABLE IF NOT EXISTS items(target TEXT, kind TEXT, id TEXT, data TEXT NOT NULL, PRIMARY KEY(target,kind,id));
           CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS items_work ON items(
+            json_extract(data,'$.status'), coalesce(json_extract(data,'$.retryAt'),0));
+          CREATE INDEX IF NOT EXISTS items_counts ON items(
+            json_extract(data,'$.status'), json_extract(data,'$.username'), kind);
         """
         )
         atomic(marker, {"required": True})
@@ -543,6 +576,7 @@ class Catalog:
                 failures=0,
                 alerted=False,
                 reason=None,
+                errorType=None,
                 lastSuccess=now,
                 nextAt=now + (PERIOD[kind] * 1000 if finished else 30000),
                 generations=(
@@ -563,6 +597,7 @@ class Catalog:
                 if isinstance(error, RuntimeError) and str(error).startswith("TIKTOK_")
                 else "TIKTOK_CATALOG_FETCH_FAILED"
             )
+            state["errorType"] = type(error).__name__
             abnormal = state.get("alerted") or state["failures"] >= 3 or needs_attention(error)
             state["phase"] = "異常／重試中" if abnormal else f"等待重試（{state['failures']}/3）"
             state["nextAt"] = now + min(3600000, 30000 * 2 ** min(state["failures"], 6))
@@ -578,13 +613,27 @@ class Catalog:
                 self.save_stream(name, kind, state)
             self.db.commit()
 
+    def ready_items(self, status, names, limit, stories_first=False):
+        """Filter and bound work in SQLite, without loading archived payloads."""
+        names = list(names)
+        if not names or limit <= 0:
+            return []
+        placeholders = ",".join("?" for _ in names)
+        order = "ORDER BY CASE kind WHEN 'story' THEN 0 ELSE 1 END" if stories_first else ""
+        return self.db.execute(
+            f"""SELECT target,kind,id,data FROM items
+              WHERE json_extract(data,'$.status')=?
+                AND coalesce(json_extract(data,'$.retryAt'),0)<=?
+                AND json_extract(data,'$.username') IN ({placeholders})
+              {order} LIMIT ?""",
+            [status, self.clock(), *names, limit],
+        ).fetchall()
+
     def repair(self, settings, limit=1):
         """Rehydrate quarantined IDs independently of discovery pagination."""
         active = subscriptions(settings)
         attempted = 0
-        for target, kind, iid, data in self.db.execute(
-            "SELECT target,kind,id,data FROM items"
-        ).fetchall():
+        for target, kind, iid, data in self.ready_items("unresolved", active, limit):
             record = json.loads(data)
             if (
                 record["status"] != "unresolved"
@@ -722,9 +771,7 @@ class Catalog:
     def drain(self, settings, limit=3):
         names = subscriptions(settings)
         count = 0
-        for target, kind, iid, data in self.db.execute(
-            "SELECT target,kind,id,data FROM items ORDER BY CASE kind WHEN 'story' THEN 0 ELSE 1 END"
-        ).fetchall():
+        for target, kind, iid, data in self.ready_items("pending", names, limit, stories_first=True):
             record = json.loads(data)
             if (
                 record["status"] != "pending"
@@ -793,19 +840,23 @@ class Catalog:
                 report["failures"] = 0
                 report["reason"] = None
         pending = unresolved = 0
-        for (data,) in self.db.execute("SELECT data FROM items"):
-            record = json.loads(data)
+        for name, kind, status, count in self.db.execute(
+            """SELECT json_extract(data,'$.username'),kind,json_extract(data,'$.status'),count(*)
+               FROM items WHERE json_extract(data,'$.status') IN ('pending','unresolved')
+               GROUP BY json_extract(data,'$.status'),json_extract(data,'$.username'),kind"""
+        ):
             if (
                 self.active_names is not None
-                and record["username"] not in self.active_names
+                and name not in self.active_names
             ):
                 continue
-            pending += record["status"] == "pending"
-            if record["status"] == "unresolved":
-                unresolved += 1
-                value = targets.get(record["username"], {}).get(record["kind"])
+            if status == "pending":
+                pending += count
+            if status == "unresolved":
+                unresolved += count
+                value = targets.get(name, {}).get(kind)
                 if value is not None:
-                    value["unresolved"] = value.get("unresolved", 0) + 1
+                    value["unresolved"] = value.get("unresolved", 0) + count
         for kinds in targets.values():
             for value in kinds.values():
                 if value.get("unresolved"):
@@ -919,6 +970,7 @@ def main():
     try:
         while not STOP.is_set():
             catalog.tick()
+            session.idle()
             STOP.wait(5)
     finally:
         STOP.set()

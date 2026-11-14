@@ -20,6 +20,62 @@ function fixture(t) {
   return {stateDir,root,settings,watcher,archive,env,fetchImpl,saves,set:v=>payload={code:200,results:v},fail:v=>fail=v};
 }
 const events = f => fs.existsSync(path.join(f.stateDir,'x/events')) ? fs.readdirSync(path.join(f.stateDir,'x/events')).map(n=>JSON.parse(fs.readFileSync(path.join(f.stateDir,'x/events',n)))) : [];
+test('idle request synchronization never rewrites durable worker state',t=>{
+  const f=fixture(t);let writes=0;
+  f.watcher.persist=()=>{writes++;};
+  f.watcher.syncRequests(1000);f.watcher.syncRequests(2000);
+  assert.equal(writes,0);
+});
+test('legacy pending payloads move off heap and survive restart with recipients intact',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  const event={statusId:'9',kind:'post',raw:{text:'x'.repeat(100000)}};
+  a.seen['post:9']=1;a.pending['post:9']={event,at:1,recipients:[{userId:'100',generation:'one'}]};
+  f.watcher.persist();
+  const restarted=new XWatcher({...f,settings:()=>f.settings});
+  assert.ok(fs.statSync(restarted.file).size<10000,'payload must not be serialized into worker.json');
+  assert.equal(restarted.account('alice').pending['post:9'].event,undefined,'payload must not remain on heap');
+  await restarted.archivePending(1000);
+  assert.deepEqual(f.saves,[event]);
+  assert.deepEqual(events(f).find(e=>e.type==='post').recipients,[{userId:'100',generation:'one'}]);
+  assert.deepEqual(fs.readdirSync(path.join(restarted.dir,'pending')),[],'completed payloads are reclaimed after commit');
+});
+test('archive batch checkpoints once and preserves every unfinished item on restart',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  for(let i=1;i<=7;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:[]};
+  let writes=0;const persist=f.watcher.persist.bind(f.watcher);
+  f.watcher.persist=()=>{writes++;persist();};
+  await f.watcher.archivePending(1000);
+  assert.equal(writes,1);
+  const restarted=new XWatcher({...f,settings:()=>f.settings});
+  assert.deepEqual(Object.keys(restarted.account('alice').pending),['post:6','post:7']);
+});
+test('interrupted migration preserves version 1 state and can resume safely',t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  for(const id of ['1','2'])a.pending[`post:${id}`]={event:{statusId:id},at:1,recipients:[]};
+  f.watcher.state.version=1;f.watcher.persist();
+  const before=fs.readFileSync(f.watcher.file,'utf8');
+  // A non-file at the content-addressed destination simulates a failed payload write.
+  const ref=f.watcher.pendingStore.put('alice','post:2',a.pending['post:2'].event);
+  const file=f.watcher.pendingStore.file(ref);fs.rmSync(file);fs.mkdirSync(file);
+  assert.throws(()=>new XWatcher({...f,settings:()=>f.settings}),/X_PENDING_PAYLOAD_INVALID/);
+  assert.equal(fs.readFileSync(f.watcher.file,'utf8'),before);
+  fs.rmdirSync(file);
+  const resumed=new XWatcher({...f,settings:()=>f.settings});
+  assert.equal(resumed.state.version,2);assert.equal(Object.keys(resumed.account('alice').pending).length,2);
+});
+test('failed batch checkpoint keeps payloads for replay; restart reclaims only orphan files',async t=>{
+  const f=fixture(t);await f.watcher.importHistory('alice',[{id:'9',username:'alice',text:'old',date:'2020-01-01',media:{images:[]}}],1000);
+  const ref=f.watcher.account('alice').pending['post:9'].eventRef;
+  const orphan=f.watcher.pendingStore.put('alice','post:10',{statusId:'10'});
+  f.watcher.persist=()=>{throw Error('ENOSPC');};
+  await assert.rejects(f.watcher.archivePending(1001),/ENOSPC/);
+  assert.ok(fs.existsSync(f.watcher.pendingStore.file(ref)));
+  const resumed=new XWatcher({...f,settings:()=>f.settings});
+  assert.ok(fs.existsSync(resumed.pendingStore.file(ref)));
+  assert.equal(fs.existsSync(resumed.pendingStore.file(orphan)),false);
+  await resumed.archivePending(2000);
+  assert.equal(Object.keys(resumed.account('alice').pending).length,0);
+});
 test('first snapshots and new subscribers are quiet; subsequent discoveries notify only eligible users',async t=>{
   const f=fixture(t);await f.watcher.cycle(1000);
   assert.equal(events(f).filter(e=>e.type==='post').length,0);assert.equal(f.saves.length,1);

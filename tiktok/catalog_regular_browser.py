@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.request
 from urllib.parse import urlparse
@@ -14,7 +15,7 @@ from catalog_browser import BrowserTransport, cookie_version
 
 class RegularBrowserTransport(BrowserTransport):
     def __init__(self, name, cookies):
-        self.chrome = self.display = self.remote = None
+        self.chrome = self.display = self.remote = self.lifecycle = self.cache = None
         super().__init__(name, cookies)
 
     def open(self, name, cookies, manual=False):
@@ -23,6 +24,8 @@ class RegularBrowserTransport(BrowserTransport):
         profile = Path(os.getenv("TIKTOK_CATALOG_PROFILE", "/data/catalog-profile"))
         profile.mkdir(parents=True, exist_ok=True)
         profile.chmod(0o700)
+        # Keep login state persistent, but never reopen an old multi-GB HTTP cache.
+        self.cache = tempfile.TemporaryDirectory(prefix="tiktok-catalog-cache-")
         self.engine = sync_playwright().start()
         # No automation/headless switches. CDP is loopback-only and not published.
         self.display = subprocess.Popen(
@@ -40,6 +43,15 @@ class RegularBrowserTransport(BrowserTransport):
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--password-store=basic",
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-background-networking",
+                "--autoplay-policy=user-gesture-required",
+                "--mute-audio",
+                "--disable-features=BackForwardCache",
+                "--disk-cache-dir=" + self.cache.name,
+                "--disk-cache-size=33554432",
+                "--media-cache-size=8388608",
                 "--remote-debugging-address=127.0.0.1",
                 "--remote-debugging-port=9222",
                 "about:blank",
@@ -86,12 +98,13 @@ class RegularBrowserTransport(BrowserTransport):
             )
             marker.write_text(version)
             marker.chmod(0o600)
-        self.page = self.context.new_page()
+        self.prepare_reader_page()
+        self.lifecycle = self.context.new_cdp_session(self.page)
         self.guard_workers()
         self.navigate(name)
 
     def guard_workers(self):
-        cdp = self.context.new_cdp_session(self.page)
+        cdp = self.lifecycle
         cdp.send("Network.enable")
         cdp.send("Network.setBypassServiceWorker", {"bypass": True})
         registrations = []
@@ -117,6 +130,29 @@ class RegularBrowserTransport(BrowserTransport):
             self.profile_url, wait_until="domcontentloaded", timeout=60000
         )
         self.page.wait_for_timeout(2000)
+
+    def pause(self):
+        if os.getenv("TIKTOK_CATALOG_FREEZE_IDLE", "1") == "1":
+            self.lifecycle.send("Emulation.setScriptExecutionDisabled", {"value": True})
+
+    def resume(self):
+        if os.getenv("TIKTOK_CATALOG_FREEZE_IDLE", "1") == "1":
+            self.lifecycle.send("Emulation.setScriptExecutionDisabled", {"value": False})
+
+    def park(self):
+        """Release the TikTok renderer between scheduler ticks, retaining login."""
+        old_page = self.page
+        # Allow exactly this replacement through the popup guard.
+        self.page = None
+        try:
+            self.page = self.context.new_page()
+        finally:
+            old_page.close()
+        self.lifecycle = self.context.new_cdp_session(self.page)
+        self.lifecycle.send("Network.enable")
+        self.lifecycle.send("Network.setBypassServiceWorker", {"bypass": True})
+        self.profile_url = "about:blank"
+        self.navigation = None
 
     def close(self):
         if self.context:
@@ -144,4 +180,7 @@ class RegularBrowserTransport(BrowserTransport):
             except subprocess.TimeoutExpired:
                 self.display.kill()
                 self.display.wait()
-        self.context = self.engine = None
+        if self.cache:
+            self.cache.cleanup()
+            self.cache = None
+        self.context = self.engine = self.lifecycle = None

@@ -21,6 +21,10 @@ X 功能直接整合於現有 Node.js／Docker 架構，不需要 n8n 或額外�
 | `X_CHECK_INTERVAL_SECONDS` | `300` | 輪詢間隔，60–86400 秒 |
 | `X_HISTORY_ENABLED` | `1` | 設為 `0` 暫停歷史任務，保留佇列；日常 FxTwitter 監控仍執行 |
 | `X_ACCOUNTS_DIR` | `./data/x-accounts` | 主機端 twscrape 帳號池目錄，內含 `accounts.db` |
+| `X_WORK_INTERVAL_SECONDS` | `5` | 工作迴圈間隔，1–60 秒；不改變日常輪詢間隔 |
+| `X_CPU_LIMIT` | `0.5` | X 容器最多使用半個 CPU 核心，包含 Python 子程序 |
+| `X_MEMORY_LIMIT` | `768m` | 整個 X 容器的記憶體上限 |
+| `X_NODE_OPTIONS` | `--max-old-space-size=384` | 限制 Node 的舊世代 heap，為原生記憶體及 Python 保留空間 |
 | `IG_DOWNLOAD_DIR` | `./downloads` | IG 與 X 共用的主機下載根目錄 |
 
 修改 `.env` 後以 `./igctl up -d --force-recreate x-watch ig-telegram` 套用。X worker 使用只讀 Telegram 設定掛載，Telegram 控制服務使用只讀下載掛載；只有 X worker 操作 X 封存與帳號池。
@@ -103,7 +107,11 @@ downloads/x/manual/alice/
 
 圖片使用序號 1 起算，影片／GIF 從 1001 起算，以來源貼文 ID 與同類媒體序號識別，避免不同來源的圖片／影片分組方式造成檔案碰撞。日常資料即時寫入 `posts/`；SQLite／JSONL／Markdown 是歷史作業的匯出，並非日常資料的即時資料庫。
 
-`data/watch/x/worker.json` 與 `.required` 保護基準、去重、待下載及回補佇列；`data/watch/x/jobs/` 保存請求狀態，`events/` 保存待傳事件。`data/control/x-delivery.json` 與 `.required` 保存每位使用者的文字與相簿收據。與 `data/control/settings.json`、帳號池及下載目錄一起私密備份，請勿刪除這些狀態檔來重試通知。事件及收據目前沒有自動過期清理。
+`data/watch/x/worker.json` 與 `.required` 保護基準、去重、待下載及回補佇列；`pending/` 保存待下載貼文的原始內容，只在下載該筆時讀入記憶體。`jobs/` 保存請求狀態，`events/` 保存待傳事件。`data/control/x-delivery.json` 與 `.required` 保存每位使用者的文字與相簿收據。與 `data/control/settings.json`、帳號池及下載目錄一起私密備份，請勿刪除這些狀態檔來重試通知。事件及收據目前沒有自動過期清理。
+
+首次升級會把舊版內嵌的待辦內容安全寫入 `pending/`，再提交 version 2 狀態；轉換中斷時，原狀態仍可重新轉換。完成下載的 payload 在狀態提交後刪除。請一起備份整個 `data/watch/x/`，不要只備份 `worker.json`。回退舊程式時必須還原升級前備份；舊程式會拒絕 version 2，避免誤讀佇列。閒置時不重寫狀態，一批最多五篇封存共用一次檢查點；若恰好在提交前中斷，最多重做該批已具冪等性的本機封存。
+
+預設資源限制以 J4125／6 GB RAM 的 NAS 為起點，與 TikTok catalog 合計最多 2.5 個 CPU 核心、2304 MiB RAM；這不是實際常駐用量，也不包含其他服務。大量歷史匯出若超過限制，請提高對應上限或暫停歷史任務；不要藉由刪除狀態清空佇列。
 
 原始 n8n JSON 含有部署憑證，已排除於 Git 與 Docker 建置內容之外；新程式不讀取或沿用其中的 token。
 

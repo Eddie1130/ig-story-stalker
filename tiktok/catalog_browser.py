@@ -58,7 +58,10 @@ class BrowserTransport:
             )
             marker.write_text(version)
             marker.chmod(0o600)
-        self.page = self.context.new_page()
+        if manual:
+            self.page = self.context.new_page()
+        else:
+            self.prepare_reader_page()
         self.profile_url = (
             "https://www.tiktok.com/login"
             if manual
@@ -74,9 +77,20 @@ class BrowserTransport:
             self.navigation = None
         self.page.wait_for_timeout(5000)
 
+    def prepare_reader_page(self):
+        self.page = self.context.new_page()
+        # Persistent profiles may restore tabs after a crash or manual login.
+        # The reader needs exactly one page; restored pages otherwise run forever.
+        for page in list(self.context.pages):
+            if page != self.page:
+                page.close()
+        self.context.on("page", lambda page: page.close() if self.page is not None and page != self.page else None)
+
     @staticmethod
     def guard(route):
         request = route.request
+        if getattr(request, "resource_type", None) in ("image", "media", "font"):
+            return route.abort()
         path = urlparse(request.url).path
         api = path.startswith("/api/")
         allowed = (

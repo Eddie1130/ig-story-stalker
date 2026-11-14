@@ -4,12 +4,16 @@ services:
       context: .
       dockerfile: Dockerfile.x
     init: true
+    cpus: ${X_CPU_LIMIT:-0.5}
+    mem_limit: ${X_MEMORY_LIMIT:-768m}
     command: ["node", "/app/src/x-watch.mjs"]
     environment:
       TZ: Asia/Hong_Kong
       X_ENABLED: ${X_ENABLED:-1}
       X_HISTORY_ENABLED: ${X_HISTORY_ENABLED:-1}
       X_CHECK_INTERVAL_SECONDS: ${X_CHECK_INTERVAL_SECONDS:-300}
+      X_WORK_INTERVAL_SECONDS: ${X_WORK_INTERVAL_SECONDS:-5}
+      NODE_OPTIONS: ${X_NODE_OPTIONS:---max-old-space-size=384}
       X_ACCOUNTS_DB: /app/x-accounts/accounts.db
       IG_ARCHIVE_DIR: /downloads
       IG_CONTROL_DIR: /app/control

@@ -1,5 +1,17 @@
 # TikTok LIVE 與 Telegram Local Bot API 整合
 
+## 低資源 NAS 的 catalog 設定
+
+`tiktok-catalog` 預設最多使用 2 個 CPU 核心、1536 MiB RAM，可在 `.env` 以 `TIKTOK_CATALOG_CPU_LIMIT` 及 `TIKTOK_CATALOG_MEMORY_LIMIT` 調整。限制包含 Python、Playwright、Chromium 及 Xvfb，不影響 LIVE 錄影容器。與 X worker 的預設上限合計 2.5 個核心、2304 MiB；仍須為 NAS 系統、IG、錄影及其他服務預留容量。
+
+自動 catalog reader 僅保留一個工作分頁，會關閉 profile 還原的舊分頁及新彈出視窗，並阻擋圖片、影音、字型載入；下載仍由原有封存流程執行，不降低保存媒體的品質。互動登入不套用這些攔截。預設以 `TIKTOK_CATALOG_FREEZE_IDLE=1` 在兩次請求之間暫停頁面腳本，請求前恢復，避免背景計時器持續佔用 CPU；必要時可設為 0。停用 Chromium 的 Back/Forward Cache，避免輪巡不同帳號時保留上一頁的執行環境。`TIKTOK_CATALOG_BROWSER_MAX_AGE_SECONDS=3600` 讓 reader 在下一次請求時每小時重建一次，保留登入 profile；可設為 0 停用，或設定 300–86400 秒。
+
+SQLite 會建立待辦及計數索引，下載／補查僅讀取本批可執行的資料，健康狀態不再把已封存貼文全部載入 Python。首次升級建立索引可能稍慢。請先備份資料，再執行 `./igctl build tiktok-catalog` 及 `./igctl up -d --no-deps tiktok-catalog x-watch`；X 程式透過 `src/` 掛載更新。較小的資源上限可能延長初次回補時間；若容器因記憶體上限被終止，請調高限制並檢查進度，勿清除資料庫。
+
+Reader 的 HTTP 快取使用每次啟動獨立的暫存目錄，Chromium 快取預算為 32 MiB，媒體快取預算為 8 MiB，關閉後清理；這些是 Chromium 的快取預算，非檔案系統硬配額。持久化 profile 仍保留登入及網站儲存狀態。舊版 `Default/Cache` 不再由 reader 使用；若要釋放既有快取空間，停止 catalog 和互動登入後，只清理該快取目錄，不要刪除整個 profile。
+
+每輪排程完成後關閉 TikTok 內容頁，換成單一空白頁，釋放 renderer 的網頁執行環境；下一次有工作才重新載入帳號。這保留登入與排程間隔，以少量重新載入時間降低常駐 RAM，不讓完整 TikTok 應用程式在閒置時留在記憶體。
+
 ## 行為
 
 Telegram 私人選單新增 **TikTok LIVE**；沿用現有白名單及私人聊天身份驗證。

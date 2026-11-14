@@ -71,6 +71,8 @@ services:
 
   tiktok-catalog:
     shm_size: 512mb
+    cpus: ${TIKTOK_CATALOG_CPU_LIMIT:-2.0}
+    mem_limit: ${TIKTOK_CATALOG_MEMORY_LIMIT:-1536m}
     build:
       context: .
       dockerfile: Dockerfile.tiktok-catalog
@@ -84,6 +86,8 @@ services:
         condition: service_healthy
     environment:
       TIKTOK_CATALOG_BROWSER: ${TIKTOK_CATALOG_BROWSER:-1}
+      TIKTOK_CATALOG_BROWSER_MAX_AGE_SECONDS: ${TIKTOK_CATALOG_BROWSER_MAX_AGE_SECONDS:-3600}
+      TIKTOK_CATALOG_FREEZE_IDLE: ${TIKTOK_CATALOG_FREEZE_IDLE:-1}
       TIKTOK_COOKIE_FILE: /app/cookies.json
       IG_TELEGRAM_CONTROL: ${IG_TELEGRAM_CONTROL:-1}
     volumes:
