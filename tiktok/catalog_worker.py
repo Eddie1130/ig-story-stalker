@@ -674,7 +674,7 @@ class Catalog:
             # Origin IDs share media across targets and activities. Profile snapshots use their hash.
             shared = safe_file(
                 self.root,
-                Path("tiktok") / folder / "media" / item["id"] / f"{index:02d}",
+                Path("tiktok") / folder / "media" / f'{item["id"]}_{index:02d}',
             )
             existing = [
                 p

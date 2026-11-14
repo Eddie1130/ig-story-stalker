@@ -390,8 +390,8 @@ class CatalogTests(unittest.TestCase):
         self.fetch.return_value = {**self.page("repost", uid="20"), "username": "bob"}
         self.catalog.poll("bob", "repost", self.settings)
         self.catalog.drain(self.settings)
-        alice = self.catalog.root / "tiktok/alice/media/1/01.mp4"
-        bob = self.catalog.root / "tiktok/bob/media/1/01.mp4"
+        alice = self.catalog.root / "tiktok/alice/media/1_01.mp4"
+        bob = self.catalog.root / "tiktok/bob/media/1_01.mp4"
         self.assertTrue(alice.exists())
         self.assertTrue(bob.exists())
         self.assertTrue(alice.samefile(bob))

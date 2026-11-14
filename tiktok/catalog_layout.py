@@ -25,7 +25,7 @@ def local_path(root, relative):
     return current
 
 
-def migrate_media_layout(root, db, state_folder):
+def _migrate_account_layout(root, db, state_folder):
     marker = Path(state_folder) / "media-layout.json"
     if marker.exists():
         saved = json.loads(marker.read_text())
@@ -96,17 +96,99 @@ def migrate_media_layout(root, db, state_folder):
     return bool(moves)
 
 
+def migrate_media_layout(root, db, state_folder):
+    """Upgrade global/v2 caches to flat account media; preserve all archive aliases."""
+    marker = Path(state_folder) / "media-layout.json"
+    if marker.exists():
+        saved = json.loads(marker.read_text())
+        if saved.get("version") == 3 and saved.get("layout") == "account-media-flat":
+            return False
+    _migrate_account_layout(root, db, state_folder)
+    owners = {}
+    for (data,) in db.execute("SELECT data FROM items"):
+        record = json.loads(data)
+        owners.setdefault(record["folder"], set()).add(record["item"]["id"])
+    moves, directories = [], []
+    for (folder,) in db.execute("SELECT folder FROM targets"):
+        media = local_path(root, Path("tiktok") / folder / "media")
+        if not media.exists():
+            continue
+        if not media.is_dir():
+            raise LayoutError("TIKTOK_MEDIA_LAYOUT_INVALID")
+        for entry in sorted(media.iterdir()):
+            local_path(root, entry.relative_to(Path(root).resolve()))
+            if entry.name == ".DS_Store" and entry.is_file():
+                target = local_path(
+                    root, Path("tiktok/.legacy-media-metadata") / folder / ".DS_Store"
+                )
+                moves.append((entry, target))
+            elif (
+                entry.is_file()
+                and re.fullmatch(r".+_\d+\.(mp4|jpg|png|webp|part)", entry.name)
+                and entry.stem.rsplit("_", 1)[0] in owners.get(folder, set())
+            ):
+                continue
+            elif entry.is_dir() and entry.name in owners.get(folder, set()):
+                directories.append(entry)
+                for source in sorted(entry.iterdir()):
+                    local_path(root, source.relative_to(Path(root).resolve()))
+                    if source.name == ".DS_Store" and source.is_file():
+                        target = local_path(
+                            root,
+                            Path("tiktok/.legacy-media-metadata")
+                            / folder
+                            / entry.name
+                            / ".DS_Store",
+                        )
+                    elif source.is_file() and re.fullmatch(
+                        r"\d+\.(mp4|jpg|png|webp|part)", source.name
+                    ):
+                        target = local_path(
+                            root,
+                            Path("tiktok")
+                            / folder
+                            / "media"
+                            / f"{entry.name}_{source.name}",
+                        )
+                    else:
+                        raise LayoutError("TIKTOK_MEDIA_LAYOUT_UNKNOWN_FILE")
+                    moves.append((source, target))
+            else:
+                raise LayoutError("TIKTOK_MEDIA_LAYOUT_UNOWNED")
+    # Preflight every account before changing any link.
+    for source, target in moves:
+        if target.exists() and not os.path.samefile(source, target):
+            raise LayoutError("TIKTOK_MEDIA_LAYOUT_CONFLICT")
+    for source, target in moves:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+        except FileExistsError:
+            if not os.path.samefile(source, target):
+                raise LayoutError("TIKTOK_MEDIA_LAYOUT_CONFLICT") from None
+        if not os.path.samefile(source, target):
+            raise LayoutError("TIKTOK_MEDIA_LAYOUT_INCOMPLETE")
+        source.unlink()
+    for directory in directories:
+        directory.rmdir()
+    atomic(
+        marker,
+        {"version": 3, "layout": "account-media-flat", "migratedFiles": len(moves)},
+    )
+    return bool(moves)
+
+
 def account_media(root, db, folder, iid, index):
     """Find an account-local cache entry or hard-link another account's copy."""
     stem = f"{index:02d}"
-    destination = local_path(root, Path("tiktok") / folder / "media" / iid / stem)
+    destination = local_path(root, Path("tiktok") / folder / "media" / f"{iid}_{stem}")
     for (other,) in db.execute("SELECT folder FROM targets"):
         if other == folder:
             continue
-        base = local_path(root, Path("tiktok") / other / "media" / iid / stem)
+        base = local_path(root, Path("tiktok") / other / "media" / f"{iid}_{stem}")
         candidates = [
             p
-            for p in base.parent.glob(stem + ".*")
+            for p in base.parent.glob(base.name + ".*")
             if p.suffix in (".mp4", ".jpg", ".png", ".webp")
         ]
         if len(candidates) == 1:
