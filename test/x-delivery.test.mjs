@@ -89,8 +89,8 @@ test('X upload groups use shared uploader and preserve group acknowledgements', 
   f.publish(); const delivery = f.delivery();
   delivery.upload = async (group, _result, userId) => ({method: group.length > 1 ? 'sendMediaGroup' : 'sendPhoto', body: {chat_id:userId,media:group}, files:[]});
   await delivery.drain(f.client);
-  assert.deepEqual(f.calls.map(c => c.method), ['sendMessage','sendMediaGroup','sendPhoto']);
-  await delivery.drain(f.client); assert.equal(f.calls.length, 3);
+  assert.deepEqual(f.calls.map(c => c.method), ['sendMediaGroup','sendPhoto']);
+  await delivery.drain(f.client); assert.equal(f.calls.length, 2);
 });
 
 test('X invalid event or damaged delivery history fails closed', async t => {
@@ -148,7 +148,7 @@ test('X rejected photo retries as document without changing receipt boundary', a
   delivery.upload = async (_group,_result,userId,documents) => {types.push(documents);return {method:documents?'sendDocument':'sendPhoto',body:{chat_id:userId},files:[]};};
   f.client.call = async (method,body,options) => {options.beforeRequest?.();f.calls.push({method,body});if(method==='sendPhoto')throw Error('TELEGRAM_ERROR_400');return {message_id:1};};
   assert.equal(await delivery.drain(f.client), true);
-  assert.deepEqual(types,[false,true]); assert.deepEqual(f.calls.map(c=>c.method),['sendMessage','sendPhoto','sendDocument']);
+  assert.deepEqual(types,[false,true]); assert.deepEqual(f.calls.map(c=>c.method),['sendPhoto','sendDocument']);
 });
 
 test('X actual local JPEG upload uses validated X paths', async t => {
@@ -157,8 +157,11 @@ test('X actual local JPEG upload uses validated X paths', async t => {
   fs.mkdirSync(path.join(f.root,'x/alice/media'),{recursive:true});fs.writeFileSync(path.join(f.root,'x/alice/media/123_01.jpg'),image);
   f.event.result.files = [{relativePath:'x/alice/media/123_01.jpg',bytes:16,mediaType:1}];f.publish();
   await f.delivery().drain(f.client);
-  assert.deepEqual(f.calls.map(c=>c.method),['sendMessage','sendPhoto']);
-  assert.equal(f.calls[1].options.files[0].blob.size,16);
+  assert.deepEqual(f.calls.map(c=>c.method),['sendPhoto']);
+  assert.equal(f.calls[0].options.files[0].blob.size,16);
+  assert.match(f.calls[0].body.caption, /hello/);
+  await f.delivery().drain(f.client);
+  assert.equal(f.calls.length, 1);
 });
 
 test('manual X link sends a photo with the post text once in its caption', async t => {
@@ -262,4 +265,16 @@ test('oversized manual results report the manual archive location', async t => {
   f.settings.xRequests['1-10-0']={id:'1-10-0',type:'manual',userId:'1',username:'alice',url:f.event.result.url};
   f.event.result.files=[{relativePath:'x/manual/alice/media/123_01.jpg',bytes:50_000_001,mediaType:1}];f.publish();
   await f.delivery().drain(f.client);assert.ok(f.calls.some(c=>c.body.text?.includes('downloads/x/manual/alice/')));
+});
+
+test('monitored X albums include the post text only in the first media caption', async t => {
+  const f=fixture(t);f.event.recipients=f.event.recipients.slice(0,1);
+  f.event.result.files=Array.from({length:2},(_,i)=>({relativePath:`x/alice/media/${i}.jpg`,bytes:16,mediaType:1}));f.publish();
+  const delivery=f.delivery();
+  delivery.upload=async(group,_result,id)=>({method:'sendMediaGroup',body:{chat_id:id,media:group.map(()=>({type:'photo',media:'attach://x',caption:'old'}))},files:[]});
+  await delivery.drain(f.client);
+  assert.deepEqual(f.calls.map(c=>c.method),['sendMediaGroup']);
+  assert.match(f.calls[0].body.media[0].caption,/hello/);
+  assert.equal(f.calls[0].body.media[1].caption,undefined);
+  await delivery.drain(f.client);assert.equal(f.calls.length,1);
 });

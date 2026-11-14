@@ -30,12 +30,13 @@ test('Telegram subscription → Fx fixture → local media → private upload �
   await watcher.cycle(2000);current='2';await watcher.cycle(63000);
   const calls=[];const client={call:async(method,body,options)=>{options.beforeRequest?.();calls.push({method,body,options});return {message_id:calls.length};}};
   const delivery=new XDelivery({...f,settings:()=>f.settings});await delivery.drain(client);
-  assert.deepEqual(calls.map(c=>c.method),['sendMessage','sendPhoto']);assert.equal(calls[1].options.files[0].blob.size,16);
+  assert.deepEqual(calls.map(c=>c.method),['sendPhoto']);assert.equal(calls[0].options.files[0].blob.size,16);
+  assert.match(calls[0].body.caption,/full text/);
   assert.ok(calls.every(c=>c.body.chat_id==='100'));assert.equal(mediaTransfers,2);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'x/alice/posts/2.json'))).result.files[0].bytes,16);
   const restarted=new XWatcher({...f,settings:()=>f.settings,fetchImpl});await restarted.cycle(124000);
   await new XDelivery({...f,settings:()=>f.settings}).drain(client);
-  assert.equal(calls.length,2);assert.equal(mediaTransfers,2);
+  assert.equal(calls.length,1);assert.equal(mediaTransfers,2);
 });
 test('disabled worker publishes a usable heartbeat without a configured bot or account pool',async t=>{
   const f=fixture(t);await run({env:{...f.env,X_ENABLED:'0'},args:['node','x-watch','--once']});

@@ -142,7 +142,7 @@ export class XDelivery {
     ].filter(Boolean).join('\n');
     const plan = result ? albumPlan(result.files) : { groups: [], oversized: [] };
     // Existing receipts may already have sent text using the old delivery order.
-    if (event.manual && plan.groups.length && entry.captionMode === undefined && entry.nextText === 0 && entry.nextGroup === 0) {
+    if (plan.groups.length && entry.captionMode === undefined && entry.nextText === 0 && entry.nextGroup === 0) {
       entry.captionMode = true; this.persist();
     }
     const captionMode = entry.captionMode === true;
