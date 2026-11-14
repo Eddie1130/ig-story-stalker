@@ -410,3 +410,16 @@ test('empty timelines cannot silently discard a gap',async t=>{
   f.set([]);await f.watcher.pollAccount('alice',now+3600000);
   assert.equal(Object.values(f.watcher.state.history).filter(j=>j.gap).length,1);
 });
+
+test('multiple legacy automatic queues consolidate without widening a running search',async t=>{
+  const f=fixture(t),now=1700000000000;
+  const first=f.watcher.enqueueHistory({username:'alice',start:'2023-11-10',end:'2023-11-11',gap:true},now);
+  const second=f.watcher.enqueueHistory({username:'alice',start:'2023-11-12',end:'2023-11-13',gap:true},now+1);
+  const running=f.watcher.enqueueHistory({username:'alice',start:'2023-11-09',end:'2023-11-10',gap:true},now+2);
+  running.status='working';
+  f.set(Array.from({length:100},(_,i)=>post(String(i+2))));
+  await f.watcher.pollAccount('alice',now+3);
+  assert.equal(first.start,'2023-11-10');assert.equal(first.end,'2023-11-13');
+  assert.equal(second.status,'cancelled');assert.equal(second.reason,'X_GAP_MERGED');
+  assert.equal(running.status,'working');assert.equal(running.end,'2023-11-10');
+});
