@@ -249,18 +249,21 @@ export class XWatcher {
     }
   }
   async archivePending(now) {
-    // Prioritize live notifications; reserve one of five slots for quiet backfill.
+    // Prioritize live notifications; reserve capacity for quiet backfill.
     // Retry deadlines and oldest-attempt ordering still apply within each queue.
     const eligible=this.names().flatMap(name=>Object.entries(this.account(name).pending).map(([key,p])=>({name,key,p})))
       .filter(({p})=>now>=(p.retryAt||0)).sort((a,b)=>(a.p.lastAttempt||0)-(b.p.lastAttempt||0)||a.p.at-b.p.at);
     const live=eligible.filter(({p})=>p.recipients.length>0);
     const quiet=eligible.filter(({p})=>p.recipients.length===0);
-    const liveCount=Math.min(live.length,quiet.length?4:5);
-    const candidates=[...live.slice(0,liveCount),...quiet.slice(0,5-liveCount)];
+    const liveCount=Math.min(live.length,quiet.length?49:50);
+    const candidates=[...live.slice(0,Math.min(2,liveCount)),...quiet.slice(0,1),
+      ...live.slice(2,liveCount),...quiet.slice(1,50-liveCount)];
     const completed=[];let changed=false;
+    const deadline=performance.now()+15000;let next=0;
     try {
-    for(const {name,key,p} of candidates) {
-        if(this.stopping)break;
+    const work=async()=>{
+      while(next<candidates.length&&!this.stopping&&performance.now()<deadline) {
+        const {name,key,p}=candidates[next++];
         changed=true;
         const a=this.account(name);p.lastAttempt=now;
         for(const job of Object.values(this.state.history))if(job.username===name&&job.archiveKeys?.includes(key))job.archiveUpdatedAt=now;
@@ -282,9 +285,14 @@ export class XWatcher {
         if(a.archiveWarned&&!Object.values(a.pending).some(item=>item.failed)) {
           this.notice(`X @${name} 封存已恢復。`,name,`${name}:archive-recovery:${now}`,undefined,{noticeKey:`archive:${name}`,noticeKind:'recovery'});a.archiveWarned=false;
         }
-    }
+      }
+    };
+    // Drain every in-flight save before committing or reclaiming payloads.
+    const results=await Promise.allSettled(Array.from({length:3},()=>work()));
+    const rejected=results.find(result=>result.status==='rejected');
+    if(rejected)throw rejected.reason;
     } finally {
-      // A crash before this checkpoint replays at most five idempotent saves.
+      // A crash before this checkpoint replays at most 50 idempotent saves.
       // Never unlink payloads until the durable queue no longer references them.
       if(changed)this.persist();
       for(const ref of completed)this.pendingStore.remove(ref);

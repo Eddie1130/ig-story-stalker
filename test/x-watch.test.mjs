@@ -41,13 +41,13 @@ test('legacy pending payloads move off heap and survive restart with recipients 
 });
 test('archive batch checkpoints once and preserves every unfinished item on restart',async t=>{
   const f=fixture(t),a=f.watcher.account('alice');
-  for(let i=1;i<=7;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:[]};
+  for(let i=1;i<=52;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:[]};
   let writes=0;const persist=f.watcher.persist.bind(f.watcher);
   f.watcher.persist=()=>{writes++;persist();};
   await f.watcher.archivePending(1000);
   assert.equal(writes,1);
   const restarted=new XWatcher({...f,settings:()=>f.settings});
-  assert.deepEqual(Object.keys(restarted.account('alice').pending),['post:6','post:7']);
+  assert.deepEqual(Object.keys(restarted.account('alice').pending),['post:51','post:52']);
 });
 test('interrupted migration preserves version 1 state and can resume safely',t=>{
   const f=fixture(t),a=f.watcher.account('alice');
@@ -485,10 +485,10 @@ test('live notifications bypass history backlog while reserving history progress
   for(let i=1;i<=10;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:[]};
   for(let i=11;i<=16;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:2,recipients:[{userId:'100',generation:'one'}]};
   await f.watcher.archivePending(1000);
-  assert.deepEqual(f.saves.map(e=>e.statusId),['11','12','13','14','1']);
-  assert.equal(events(f).filter(e=>e.type==='post').length,4);
+  assert.deepEqual(f.saves.map(e=>e.statusId),['11','12','1','13','14','15','16','2','3','4','5','6','7','8','9','10']);
+  assert.equal(events(f).filter(e=>e.type==='post').length,6);
   await f.watcher.archivePending(2000);
-  assert.deepEqual(f.saves.slice(5).map(e=>e.statusId),['15','16','2','3','4']);
+  assert.deepEqual(f.saves.slice(16).map(e=>e.statusId),[]);
 });
 test('backed-off live notifications do not block eligible live or history work',async t=>{
   const f=fixture(t),a=f.watcher.account('alice');
@@ -511,4 +511,16 @@ test('manual history progress notices reuse one scope and are throttled', t => {
   assert.equal(progress.length, 2);
   assert.ok(progress.every(e => e.noticeKey === `history:${job.id}`));
   assert.ok(progress.every(e => /預計完成：/.test(e.text)));
+});
+
+test('archive dispatch stops at the time budget with at most three saves in flight',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  for(let i=1;i<=10;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:i===10?[]:[{userId:'100'}]};
+  let clock=0,active=0,peak=0,calls=0;
+  t.mock.method(performance,'now',()=>clock);
+  f.archive.save=async()=>{calls++;active++;peak=Math.max(peak,active);await Promise.resolve();clock=15001;active--;return {errors:[]};};
+  await f.watcher.archivePending(1000);
+  assert.equal(calls,3);assert.equal(peak,3);assert.equal(active,0);
+  assert.equal(a.pending['post:10'],undefined,'history gets a slot before the budget expires');
+  assert.equal(Object.keys(a.pending).length,7);
 });

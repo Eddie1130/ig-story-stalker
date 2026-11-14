@@ -1,3 +1,4 @@
+import { archiveBatch } from './archive-batch.mjs';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -138,8 +139,7 @@ export class StoryArchive {
     }
     this.persist();
   }
-  async run(signal, { limit = 5, budgetMs = 90000, shouldYield = () => false } = {}) {
-    const started = Date.now();
+  async run(signal, { limit = 50, budgetMs = 15000, shouldYield = () => false } = {}) {
     const probe = path.join(this.root, `.ig-write-test-${randomUUID()}`);
     try {
       // Do not create root: a missing mount must be a visible error.
@@ -147,31 +147,29 @@ export class StoryArchive {
       await fsp.unlink(probe);
     } catch (e) { this.log('NAS_STORAGE_ERROR', { reason: archiveReason(e) }); return false; }
     this.log('NAS_STORAGE_OK');
-    let ok = true, count = 0;
+    let ok = true;
     const pending = Object.values(this.state.pending).sort((a,b) => Number(!!a.failures) - Number(!!b.failures) || (a.lastAttemptAt || 0) - (b.lastAttemptAt || 0));
-    for (const story of pending) {
-      if (signal?.aborted || shouldYield() || count >= limit || Date.now() - started >= budgetMs) break;
+    await archiveBatch(pending, async story => {
       if (Date.now() - story.detectedAt > 7 * 86400000) {
         this.state.failed[story.id] = { at: Date.now(), reason: story.error || 'NAS_RETRY_EXPIRED' };
         delete this.state.pending[story.id]; this.persist();
-        this.log('STORY_ARCHIVE_RETIRED', { id: story.id }); ok = false; continue;
+        this.log('STORY_ARCHIVE_RETIRED', { id: story.id }); ok = false; return;
       }
-      count++;
       this.log('STORY_ARCHIVE_STARTED', { id: story.id });
       let result;
       try {
-        result = await this.download(this.root, story.archiveBase, story, { signal, timeoutMs: Math.min(60000, Math.max(1000, budgetMs - (Date.now() - started))) });
+        result = await this.download(this.root, story.archiveBase, story, { signal, timeoutMs: 60000 });
       } catch (e) {
-        if (signal?.aborted) break;
+        if (signal?.aborted) return;
         story.failures = (story.failures || 0) + 1; story.error = archiveReason(e); story.lastAttemptAt = Date.now();
         this.persist(); this.log('STORY_ARCHIVE_RETRY', { id: story.id, reason: story.error }); ok = false;
-        continue;
+        return;
       }
       // State failure must escape, not be mistaken for a network retry.
       this.state.saved[story.id] = { ...result, at: Date.now() };
       delete this.state.pending[story.id]; this.persist();
       this.log('STORY_ARCHIVE_SAVED', { id: story.id, ...result });
-    }
+    }, { limit, budgetMs, shouldYield, signal });
     this.log('WATCH_ARCHIVE_STATUS', { pendingCount: Object.keys(this.state.pending).length, failedCount: Object.keys(this.state.failed).length, savedCount: Object.keys(this.state.saved).length });
     return ok && Object.keys(this.state.pending).length === 0 && Object.keys(this.state.failed).length === 0;
   }

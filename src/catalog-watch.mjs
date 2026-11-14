@@ -1,3 +1,4 @@
+import { archiveBatch } from './archive-batch.mjs';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -142,7 +143,7 @@ export class CatalogWatcher {
     }
   }
   async deliver(signal,sendTelegram,{shouldYield=()=>false}={}) {
-    const started=Date.now();let ok=true,downloads=0,sends=0,tgBlocked=false;
+    const started=Date.now();let ok=true,sends=0,tgBlocked=false;
     try { if (!(await fsp.stat(this.root)).isDirectory()) throw Error('CATALOG_ROOT_NOT_DIRECTORY'); }
     catch(e) { this.log('CATALOG_STORAGE_ERROR',{reason:safeReason(e)}); return false; }
     this.log('CATALOG_STORAGE_OK');
@@ -158,16 +159,16 @@ export class CatalogWatcher {
       this.persist();this.log('CATALOG_CAPTION_SAVED',{id});
     }
     const pending=Object.values(this.state.assets).filter(a=>!a.archiveDone||!a.telegramDone).sort((a,b)=>(a.lastAttemptAt||0)-(b.lastAttemptAt||0));
+    await archiveBatch(pending.filter(asset=>!asset.archiveDone),async asset=>{
+      this.log('CATALOG_MEDIA_STARTED',{key:asset.key});
+      let saved;
+      try{saved=await this.downloader(this.root,asset.base,asset,{signal,timeoutMs:45000});}
+      catch(e){if(signal.aborted||shouldYield())return;ok=false;asset.lastAttemptAt=Date.now();this.log('CATALOG_ARCHIVE_RETRY',{key:asset.key,reason:archiveReason(e)});}
+      if(saved){asset.archiveDone=true;asset.relativePath=saved.relativePath;asset.bytes=saved.bytes;this.persist();this.log('CATALOG_MEDIA_SAVED',{key:asset.key,path:saved.relativePath,bytes:saved.bytes});}
+    },{signal,shouldYield});
     for(const asset of pending) {
       if(signal.aborted||shouldYield()||Date.now()-started>=90000)break;
-      if ((asset.archiveDone || downloads >= 5) && (asset.telegramDone || tgBlocked || sends >= 5)) continue;
-      if(!asset.archiveDone && downloads<5){
-        downloads++;this.log('CATALOG_MEDIA_STARTED',{key:asset.key});
-        let saved;
-        try{saved=await this.downloader(this.root,asset.base,asset,{signal,timeoutMs:Math.min(45000,Math.max(1000,90000-(Date.now()-started)))});}
-        catch(e){if(signal.aborted||shouldYield())break;ok=false;asset.lastAttemptAt=Date.now();this.log('CATALOG_ARCHIVE_RETRY',{key:asset.key,reason:archiveReason(e)});}
-        if(saved){asset.archiveDone=true;asset.relativePath=saved.relativePath;asset.bytes=saved.bytes;this.persist();this.log('CATALOG_MEDIA_SAVED',{key:asset.key,path:saved.relativePath,bytes:saved.bytes});}
-      }
+      if(asset.telegramDone||tgBlocked||sends>=5)continue;
       if(!asset.telegramDone&&!tgBlocked&&sends<5&&!signal.aborted){
         sends++;this.log('CATALOG_TELEGRAM_STARTED',{key:asset.key});
         const label=asset.kind==='post'?'IG 新貼文':`IG 精選：${asset.title}`;
@@ -181,7 +182,7 @@ export class CatalogWatcher {
         if(sent){asset.telegramDone=true;this.persist();this.log('CATALOG_TELEGRAM_SENT',{key:asset.key});}
       }
       asset.lastAttemptAt=Date.now();this.persist();
-      if(downloads>=5&&(sends>=5||tgBlocked))break;
+      if(sends>=5||tgBlocked)break;
     }
     const pendingArchive=Object.values(this.state.assets).filter(a=>!a.archiveDone).length;
     const pendingTelegram=Object.values(this.state.assets).filter(a=>!a.telegramDone).length;
