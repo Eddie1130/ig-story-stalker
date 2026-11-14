@@ -1,4 +1,17 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-exec docker compose -f docker-compose.yml -f compose.watch.yml -f compose.health.yml -f compose.x.yml -f compose.tiktok.yml -f compose.export.yml "$@"
+
+if [ "${1:-}" = "down" ]; then
+    shift
+    set -- --profile '*' down "$@"
+fi
+
+exec docker compose \
+    -f docker-compose.yml \
+    -f compose.watch.yml \
+    -f compose.health.yml \
+    -f compose.x.yml \
+    -f compose.tiktok.yml \
+    -f compose.export.yml \
+    "$@"
