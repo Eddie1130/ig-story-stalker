@@ -1,212 +1,102 @@
-# IG Story Stalker
+# Social Media Stalker
 
-A self-hosted Instagram Story watcher that reuses a manually authenticated Chromium profile, checks one or more accounts for new Stories, delivers available photos and videos to Telegram, and archives Stories, posts, and Highlights to disk.
+自架的 Instagram、X／Twitter 與 TikTok 監控及封存工具。訂閱帳號後，自動將可存取的內容保存到本機，並透過同一個 Telegram Bot 接收通知、下載連結內容及管理個人訂閱。
 
-The project is designed for unattended Docker deployments. It includes a fail-closed network guard, persistent delivery state, health checks, a supervising worker, and an independent watchdog.
+適合以 Docker 長期運行，提供持久化佇列、重試、健康檢查與獨立 watchdog。Instagram 使用手動登入的 Chromium 工作階段；X 使用 FxTwitter，歷史回補另需 twscrape 帳號池；TikTok 支援內容監控與 LIVE 錄影。
 
-> [!WARNING]
-> This is an unofficial tool built on Instagram's private web APIs. Those APIs and document IDs can change without notice. Use it only for accounts and content you are authorized to access, comply with applicable terms and laws, and do not treat the read-receipt guard as a guarantee of anonymity.
->
-> **Do not use your primary or personal Instagram account.** Use a dedicated secondary account whose loss, lockout, or challenge would not affect your main account. Its authenticated browser profile is stored locally under `data/profile/`.
+> [!IMPORTANT]
+> Instagram 請使用專用小號，避免主要帳號因驗證、鎖定或停權受到影響。本工具依賴非官方介面與第三方服務；平台變更可能使功能失效。僅處理你有權存取的內容，並遵守平台條款及適用規範。阻擋已讀請求的網路防護不代表匿名保證。
 
-## Features
+## 目錄
 
-- Manual Instagram login through a temporary noVNC container
-- Persistent Chromium session stored outside the image
-- Multiple target accounts with independent download folders, delivery history and retries
-- Private Telegram menus with whitelisted users, personal subscriptions and notification preferences
-- Headless Story checks with configurable intervals and exponential backoff
-- Direct Telegram delivery for supported Story photos and videos
-- Deduplication and durable retry state across restarts
-- A network guard that blocks Story seen/read mutations and unexpected Instagram write requests
-- Supervisor and watchdog health monitoring with queued Telegram alerts
-- JSON audit logs that avoid recording signed media URLs
+- [功能與平台](#功能與平台)
+- [部署前準備](#部署前準備)
+- [快速開始](#快速開始)
+- [Telegram 操作](#telegram-操作)
+- [設定參考](#設定參考)
+- [封存與資料目錄](#封存與資料目錄)
+- [日常維護與升級](#日常維護與升級)
+- [故障排除](#故障排除)
+- [開發驗證](#開發驗證)
+- [詳細文件與參考](#詳細文件與參考)
 
-## Media downloads
+## 功能與平台
 
-The watcher archives Stories and scans profile posts and Highlights by default.
-Docker mounts `IG_DOWNLOAD_DIR` (default: `./downloads`) at `/downloads` inside
-`ig-watch`. No Synology-specific paths or additional Compose overlays are needed.
-An existing `.env` also uses these defaults without adding new variables.
+| 平台 | 自動監控／封存 | 手動操作 | 必要 worker |
+| --- | --- | --- | --- |
+| Instagram | Story、貼文輪播、精選動態 | 貼文、Reel、Story、精選及分享連結下載 | `ig-watch` |
+| X／Twitter | 新貼文與媒體 | 單篇連結下載、歷史回補 | `x-watch` |
+| TikTok | LIVE 錄影、貼文／照片、轉發、Story、個人資料變更；可選公開讚好 | 影片、照片及短分享連結下載 | `tiktok-watch`（LIVE）、`tiktok-catalog`（內容／連結） |
 
-```text
-downloads/instagram/
-  alice/
-    stories/20261016_013000_JST_123456.mp4
-    posts/00001_20261016_013000_JST/
-      01.jpg
-      02.mp4
-      caption.txt
-    highlight/01_旅行/
-      001_20261016_013000_JST.jpg
-  bob/
-    stories/
-    posts/
-    highlight/
-```
+- **共用 Bot、個人設定**：白名單使用者各自管理訂閱與通知；同帳號內容只擷取一次，傳送收據按使用者保存。
+- **本機封存獨立運作**：關閉通知不會停止下載；取消最後一位訂閱者才停止該帳號後續監控，既有檔案保留。
+- **可恢復的背景工作**：下載與傳送分開記錄，重啟後可繼續處理；Telegram 回應遺失時仍可能重複傳送。
+- **選用 ZIP 匯出**：在 Telegram 申請單一帳號的既有封存，透過 HTTPS 連結下載，有效期 24 小時。需額外啟用匯出服務及 tunnel。
 
-When upgrading an existing installation, stop all old watcher processes before
-starting the new version. The watcher moves registered Instagram account folders
-and the old `downloads/manual/` folder into `downloads/instagram/`. It keeps a
-migration journal and refuses to overwrite conflicting folders. Keep a private
-backup of the download and state directories before upgrading.
+Instagram 首次貼文／精選掃描會安靜下載可存取歷史，之後的新發現才發媒體通知；加入時仍可讀取的 Story 可立即通知。獨立 Reels 分頁不在自動掃描範圍，但可貼連結下載。已過期或刪除且未保存的內容無法保證恢復。
 
-Filenames use publication time in JST, with detection time as the Story fallback.
-Images retain their actual `.jpg`, `.png`, or `.webp` format. Post carousels retain
-all available photos and videos. Numbering is assigned on first discovery and
-persists across restarts; existing folders retain their original Highlight title.
-Caption edits update `caption.txt` without resending media. Deleted Instagram
-content stays on disk, and downloaded files have no automatic expiry.
+## 部署前準備
 
-The first post/Highlight scan downloads accessible history without Telegram media
-notifications. Later discoveries are downloaded and sent individually to Telegram.
-Story archiving is independent of Telegram delivery, so currently available Stories
-can be archived even if already sent. Expired or deleted Stories cannot be recovered
-unless their media remains accessible. The dedicated Reels tab is not scanned.
+| 項目 | 用途 |
+| --- | --- |
+| Docker Engine／Docker Desktop 與 Compose v2 | 執行服務；主機需有足夠下載與錄影空間 |
+| Telegram Bot token、私人 chat ID | 共用選單與通知；先向 Bot 傳送訊息 |
+| Telegram API ID／hash | `igctl` 預設使用的 Local Bot API，填入 `.env.tiktok` |
+| 專用 Instagram 帳號 | 啟用 Instagram 時，手動建立登入工作階段 |
+| Surfshark OpenVPN service 憑證、TikTok cookies、`/dev/net/tun` | 啟用 TikTok 時使用；LIVE worker 為 `linux/amd64`，ARM 主機需模擬支援 |
+| twscrape `accounts.db` | X 歷史回補所需；一般監控與單篇下載另見 X 指南 |
 
-All accounts share the saved Instagram login and polling settings. Each approved
-Telegram user has their own private subscriptions and notification switches. A target
-followed by several users is fetched and archived once, while each user's delivery
-acknowledgements and retries remain independent. Disabling notifications never disables
-local archiving. Removing the last subscription stops future work for that target;
-an in-flight check/download may finish. Files and history remain on disk.
+日常監控在 Docker 內運行，不需要主機安裝 Node.js 或 Python。本機 JavaScript 測試與 Telegram Local Bot API 遷移腳本需要 Node.js 22 以上；匯出測試另需 Python 3。
 
-Checks run sequentially, with a two-second pause between accounts; a slow account can
-delay later accounts. Each account has independent fetch backoff, archive queues,
-post numbering and baseline scans. A failed lookup, fetch, or damaged account history
-leaves other accounts running. Damaged histories are never replaced with empty state;
-account initialization/storage failures retry every five minutes and remain visible
-in health. A shared login/challenge failure pauses all accounts, emits an alert, and
-probes the login every five minutes before resuming.
+## 快速開始
 
-Stories use `IG_CHECK_INTERVAL_SECONDS` (default 300). Post scans and Highlight
-scans use `IG_POSTS_INTERVAL_SECONDS` and `IG_HIGHLIGHTS_INTERVAL_SECONDS` (default
-900, range 300–86400). Pagination and Highlight reads run sequentially using the
-same Chromium profile; a large scan can take several watcher cycles. Each archive
-queue attempts at most five media downloads per cycle with a 90-second download
-budget. Slow Telegram requests can extend the total cycle.
+以下命令均在專案根目錄執行。先建立共用 Telegram 服務，再啟動需要的平台。
 
-Set `IG_CATALOG_ENABLED=0` to disable posts and Highlights while retaining Story
-archiving. Set `IG_DOWNLOAD_DIR` to another host directory if desired. After changing
-settings, recreate the watcher with `./igctl up -d --force-recreate ig-watch`.
+### 1. 建立設定檔
 
-Archive and Telegram state are tracked independently under `data/watch/` (or
-`IG_DATA_DIR/watch/`): `archive-<target>.json`, `catalog-<target>.json`, and their
-`.required` markers protect download history and stable numbering. Do not delete
-these to retry a download. Downloaded files and credentials are excluded from Git
-and Docker build contexts; keep state and download backups private.
-
-Downloads validate the CDN host, redirects, size and file signature, then rename
-`.part` files atomically. Failures remain queued and trigger supervisor/watchdog
-alerts with recovery notifications. Story downloads retire after seven days with
-an unresolved alert; catalog downloads remain pending. Saved files are not periodically
-revalidated, and manually deleted successful files are not automatically restored.
-Telegram retries can produce duplicate messages if an acknowledgement is lost.
-
-Check `WATCH_MEDIA_STARTED` for `archiveEnabled:true` and `catalogEnabled:true`,
-`STORY_ARCHIVE_SAVED` / `CATALOG_MEDIA_SAVED` for saved files, and `CATALOG_STATUS`
-for baseline completion and pending work. `STORY_MEDIA_SENT` alone does not mean
-a file was archived. Verify downloaded files on the host as well.
-
-Posts and Highlights use private read-only GraphQL queries with an exact request
-allowlist; the Story guard remains unchanged. `IG_POSTS_DOC_ID` and
-`IG_POSTS_PAGE_DOC_ID` can override post query IDs. Instagram API changes, session
-expiry, rate limits, and unsupported response pagination are reported as errors
-rather than an empty or complete scan. The test suite uses controlled fixtures;
-it does not verify live Instagram compatibility.
-
-### Upgrading existing downloads
-
-Stop the old watcher before upgrading, and keep a private backup of `data/` and
-`downloads/`. On the first successful initialization, the worker moves the old root
-`stories/`, `posts/` and `highlight/` directories under their original account folder.
-It identifies ownership from the numeric-ID histories, preserves those histories and
-Telegram sent IDs, and records the layout in `data/watch/archive-layout.json` plus
-its `.required` marker. A journal resumes interrupted directory moves after restart.
-Do not delete these layout files or move account folders manually.
-
-The old account can appear anywhere in the new list. If it is removed or cannot be
-resolved during migration, its retained archive uses its numeric ID as the folder
-name. Accounts named `stories`, `posts`, or `highlight` use `<username>_<ID>` to avoid
-colliding with legacy directories. Folder assignments remain stable by numeric ID
-if a username later changes. Removed accounts' files and histories remain on disk.
-
-If legacy ownership is ambiguous, the destination already contains conflicting
-files, or a directory is a symlink, migration fails visibly without overwriting
-files. Resolve the reported layout conflict using your backup before retrying.
-Keep the old account configured during the upgrade so its outstanding supervisor
-alerts can also migrate and recover under the correct account identity.
-
-TikTok 多帳號貼文／轉發／Story／個人資料監控、LIVE 錄影、共用 Local Bot API 與啟用步驟請見 [TikTok 整合說明](docs/tiktok-integration.md)。
-
-## Requirements
-
-X／Twitter 功能、帳號池設定與升級步驟請見 [X 整合說明](docs/x-integration.md)。
-
-- Docker Engine with Docker Compose v2
-- A Telegram bot token and destination chat ID
-- The target accounts' Instagram usernames
-- Network access to Instagram and the Telegram Bot API
-
-No host-level Node.js installation is required for normal use. Node.js 22 or newer is only needed for local syntax checks.
-
-## Quick start
-
-### 1. Configure the watcher
+全新安裝執行；既有部署請保留原檔，對照範本補上缺少設定。
 
 ```sh
 cp .env.example .env
 cp .env.telegram.example .env.telegram
-chmod 600 .env .env.telegram
+cp .env.tiktok.example .env.tiktok
+chmod 600 .env .env.telegram .env.tiktok
 ```
 
-Edit both files:
+編輯以下欄位：
 
-- `IG_TARGET_USERNAMES=alice,bob,charlie` supplies the initial owner subscriptions (usernames only, without `@`). Whitespace is trimmed and duplicate names are ignored, case-insensitively. Once Telegram settings are initialized, manage subscriptions through the menu; editing the environment does not overwrite saved choices.
-- A nonempty `IG_TARGET_USERNAMES` takes precedence over both legacy target variables. Each username is resolved separately; a stale `IG_TARGET_USER_ID` cannot override the list.
-- If the list is unset or empty, the original `IG_TARGET_USERNAME` and optional `IG_TARGET_USER_ID` still work. In legacy mode a numeric ID skips lookup.
-- `IG_CHECK_INTERVAL_SECONDS` must be between 60 and 86400.
-- `VNC_PASSWORD` must be unique and at least 8 characters.
-- `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` control delivery.
+| 檔案 | 必填／初始設定 |
+| --- | --- |
+| `.env` | `VNC_PASSWORD` 改為唯一且至少 8 字元的密碼；Instagram 初始訂閱填入 `IG_TARGET_USERNAMES=alice,bob`，不用 `@` |
+| `.env.telegram` | `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`；若 chat ID 是群組負數，另填擁有者的數字 `TELEGRAM_OWNER_USER_ID` |
+| `.env.tiktok` | `TELEGRAM_API_ID`、`TELEGRAM_API_HASH`；啟用 TikTok 時另填 VPN 憑證並準備 cookies |
 
-Automatic lookup runs once per account per worker lifetime; failed lookups retry independently. It uses
-the saved Instagram session to read the target profile page and extract its numeric ID
-from embedded account or route data. It updates only the running process environment and keeps
-history keyed by numeric ID. It does not write to `.env`. Lookup failures (including rate limits or an unexpected account response) back off
-for that account while other targets continue. An expired shared session pauses all targets. `TARGET_RESOLVED` records a successful lookup.
-The Telegram-only test does not require an Instagram lookup. It uses the legacy
-`TELEGRAM_CHAT_ID` destination; normal controlled delivery uses each approved user's private chat.
+即使只使用 Instagram，`igctl` 也會載入 Local Bot API 設定，因此仍需 `.env.tiktok` 的 API ID／hash。VPN 憑證只在啟動 TikTok 服務時使用。
 
-The default noVNC binding is `127.0.0.1:6080`. Keep it local whenever possible.
+```sh
+./igctl config --quiet
+```
 
-### 2. Create the Instagram session
+此命令僅驗證 Compose 設定，不會確認登入、憑證或平台服務可用。
 
-Use a dedicated secondary Instagram account for this session. Do not log in with your primary or personal account.
+### 2. 建立 Instagram 登入工作階段
 
-Build and start the temporary login container:
+若不使用 Instagram，可跳到下一步。
 
 ```sh
 docker compose --profile login build ig-login
 docker compose --profile login run --rm --service-ports ig-login
 ```
 
-Open the following page and enter the VNC password from `.env`:
+開啟 [本機 noVNC](http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale)，輸入 `.env` 的 VNC 密碼，使用專用小號登入 Instagram。完成後在終端按 `Ctrl-C`，等到出現 `LOGIN_BROWSER_STOPPED`；登入資料保存在 `data/profile/`。請勿同時讓多個瀏覽器命令使用該 profile。
 
-```text
-http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
-```
-
-Log in to Instagram, then stop the container with `Ctrl-C`. Wait for
-`LOGIN_BROWSER_STOPPED` before running another browser command. Chromium closes
-cleanly and the session is retained in `data/profile/`.
-
-For a remote host, prefer an SSH tunnel instead of exposing noVNC:
+遠端主機先建立 SSH tunnel，再於自己的電腦開啟上面的網址：
 
 ```sh
 ssh -L 6080:127.0.0.1:6080 user@your-server
 ```
 
-### 3. Verify the session and safety guard
+檢查登入及網路防護：
 
 ```sh
 docker compose build ig-check
@@ -214,316 +104,229 @@ docker compose run --rm ig-check
 docker compose run --rm ig-check node /app/src/guard-selftest.mjs
 ```
 
-A valid session emits `SESSION_OK`. The guard test should emit `GUARD_SELFTEST_PASS`.
+預期分別看到 `SESSION_OK` 與 `GUARD_SELFTEST_PASS`。
 
-### 4. Test Telegram delivery
+### 3. 啟動共用 Telegram 服務
+
+**從雲端 API 切換既有 Bot 前**，先停止其他使用同一 token 的服務，完成 [Local Bot API 遷移](docs/tiktok-integration.md#首次切換既有-telegram-bot)及雲端 `logOut`。同一 Bot 只能有一個收訊 poller。
+
+完成必要的遷移後：
 
 ```sh
+./igctl up -d telegram-bot-api
 ./igctl build ig-watch ig-watchdog ig-telegram
 ./igctl run --rm ig-watch node /app/src/watch-media.mjs --test-telegram
+./igctl up -d ig-telegram ig-watchdog
 ```
 
-The test sends a text message only. It does not fetch or deliver a Story.
+測試只傳送文字，不會擷取或傳送 Story。它使用 `TELEGRAM_CHAT_ID`；正常私人選單配送則使用各核准使用者的私人聊天。
 
-### 5. Start continuous monitoring
+### 4. 啟動需要的平台
+
+**Instagram：**
 
 ```sh
-./igctl up -d ig-watch ig-watchdog ig-telegram
+./igctl up -d ig-watch
+```
+
+**X／Twitter：**
+
+```sh
+./igctl up -d --build x-watch
+```
+
+在 Telegram 傳送 `/xadd alice`。歷史回補另需有效的 twscrape 帳號池，請依 [X 整合說明](docs/x-integration.md)設定。沒有啟動 `x-watch` 時，回補申請會一直停在「等待排入佇列」。
+
+**TikTok：**先完成 [VPN、cookies 與登入設定](docs/tiktok-integration.md)，再執行：
+
+```sh
+./igctl up -d --build tiktok-vpn tiktok-browser-resolver tiktok-watch tiktok-catalog
+```
+
+在 Telegram 傳送 `/ttadd alice`。LIVE 錄影與內容監控由不同 worker 處理；手動連結下載需要 `tiktok-catalog`，不用先訂閱帳號。
+
+### 5. 確認運行
+
+```sh
 ./igctl ps
 ./igctl logs -f ig-watch ig-watchdog ig-telegram
 ```
 
-要啟用 X／Twitter 監控與歷史回補，還必須啟動 X worker：
+在 Bot 的私人聊天傳送 `/start` 或 `/menu`，以 `/status` 查看自己的訂閱與狀態。查看其他平台日誌時，將服務名稱換成 `x-watch`、`tiktok-watch` 或 `tiktok-catalog`。
+
+`igctl` 會合併 `docker-compose.yml`、`compose.watch.yml`、`compose.health.yml`、`compose.x.yml`、`compose.tiktok.yml` 及 `compose.export.yml`。匯出與 tunnel 服務預設透過 profile 關閉。
+
+## Telegram 操作
+
+只有核准使用者的私人聊天可以操作；每位使用者都必須先向 Bot 傳送 `/start`。
+
+| 操作 | 指令／選單 |
+| --- | --- |
+| 開啟選單／查看狀態 | `/menu`、`/status` |
+| 新增 Instagram 訂閱 | `/add alice` 或「新增帳號」 |
+| 新增 X／TikTok 訂閱 | `/xadd alice`、`/ttadd alice` |
+| 下載連結 | 直接貼上連結，或 `/download <連結>` |
+| X 歷史回補 | `/xhistory alice`；指定 UTC 日期範圍：`/xhistory alice 2024-01-01 2025-01-01`，不含結束日 |
+| 調整通知／取消訂閱 | 對應平台的帳號選單 |
+| 每日摘要 | 選單啟用；預設關閉，啟用後於香港時間每日 20:00 發送 |
+| 取消輸入 | `/cancel` |
+| 匯出已保存內容 | 帳號選單「📦 匯出全部封存」；需先完成匯出部署 |
+
+擁有者由 `TELEGRAM_OWNER_USER_ID` 指定，未設定時使用正數 `TELEGRAM_CHAT_ID`。其他核准使用者填入 `.env.telegram` 的 `TELEGRAM_ALLOWED_USER_IDS`，修改後重新建立 `ig-telegram`。擁有者永遠在核准名單內；群組訊息與未核准使用者會被忽略。
+
+初次啟動會把環境變數中的 Instagram 訂閱匯入擁有者設定。之後請透過 Telegram 管理，修改 `.env` 不會覆寫已儲存的選擇；新使用者從空清單開始。設定保存在 `data/control/`，重啟不會清除。
+
+### 手動連結下載
+
+Instagram 支援貼文、Reel、Story、精選及分享連結；貼文／Reel 會下載完整輪播，精選連結下載整個可存取集合。帳號首頁會先詢問是否加入訂閱。IG／X 每則訊息合計最多十個連結，每個連結獨立排程。
+
+TikTok 支援 `/@帳號/video/ID`、`/@帳號/photo/ID` 與 `vm.tiktok.com`、`vt.tiktok.com`、`tiktok.com/t/` 分享連結。手動下載不需要先訂閱該帳號，也不受自動通知開關影響。
+
+檔案先下載到本機，再交由 Telegram 傳送。Instagram 會選取可用的高解析度／位元率；需要合併音軌時使用 FFmpeg stream copy。無法以照片／影片顯示的內容可改以文件傳送；超過傳送上限的檔案留在本機並回報。上傳結果不確定時，系統會請你先確認聊天內容；重新貼連結代表明確申請再次傳送。
+
+完整佇列、快取、重試與傳送規則見 [Instagram 操作細節](docs/instagram-operations.md#download-an-instagram-link)。
+
+## 設定參考
+
+以下為常用設定；平台專屬選項請查看範本及整合指南。
+
+| 變數 | 檔案 | 預設／行為 |
+| --- | --- | --- |
+| `IG_TARGET_USERNAMES` | `.env` | 初始訂閱，以逗號分隔；非空時優先於舊版單帳號變數 |
+| `IG_TARGET_USERNAME`／`IG_TARGET_USER_ID` | `.env` | 舊版單帳號模式；僅清單為空時使用，數字 ID 可略過查詢 |
+| `IG_CHECK_INTERVAL_SECONDS` | `.env` | Story 間隔 `300` 秒；範圍 `60–86400` |
+| `IG_CATALOG_ENABLED` | `.env` | `1`；設為 `0` 停用貼文／精選掃描，保留 Story 封存 |
+| `IG_POSTS_INTERVAL_SECONDS`／`IG_HIGHLIGHTS_INTERVAL_SECONDS` | `.env` | 各 `900` 秒；範圍 `300–86400` |
+| `IG_DOWNLOAD_DIR` | `.env` | `./downloads`；容器內掛載至 `/downloads` |
+| `IG_DATA_DIR`／`IG_LOG_DIR` | `.env` | `./data`／`./logs` |
+| `VNC_PASSWORD` | `.env` | 登入時必填，拒絕範例密碼與少於 8 字元的密碼 |
+| `NOVNC_BIND_ADDRESS`／`NOVNC_PORT` | `.env` | `127.0.0.1`／`6080` |
+| `IG_TELEGRAM_CONTROL` | `.env` | Compose 預設 `1`；`0` 使用舊版單一目的地配送，選單設定不會回寫環境變數 |
+| `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | `.env.telegram` | Bot 憑證及舊版／測試目的地 |
+| `TELEGRAM_OWNER_USER_ID` | `.env.telegram` | 擁有者數字 ID；舊 chat ID 為群組時需明確設定 |
+| `TELEGRAM_ALLOWED_USER_IDS` | `.env.telegram` | 其他核准使用者的數字 ID，以逗號分隔 |
+| `TELEGRAM_API_ID`／`TELEGRAM_API_HASH` | `.env.tiktok` | Local Bot API 所需 |
+| `ARCHIVE_EXPORT_ENABLED` | `.env` | `0`；完成 HTTPS 匯出部署後才啟用 |
+
+修改容器設定後，重新建立對應服務，例如：
 
 ```sh
-./igctl up -d x-watch
+./igctl up -d --force-recreate ig-watch ig-telegram
 ```
 
-只啟動上面的三個 IG／Telegram 服務，回補申請會一直顯示「等待排入佇列」。
-歷史回補還需要有效的 twscrape `accounts.db`；設定方式見 [X 整合說明](docs/x-integration.md)。
+## 封存與資料目錄
 
-Stop all monitoring services with:
+預設主機目錄如下；修改 `IG_DATA_DIR`、`IG_DOWNLOAD_DIR` 或 `IG_LOG_DIR` 時，以實際掛載為準。TikTok cookies 預設仍使用 `./data/tiktok/cookies.json`。
+
+```text
+downloads/
+  instagram/
+    alice/
+      stories/
+      posts/                  # 輪播媒體與 caption.txt
+      highlight/
+    manual/<username>/        # 手動下載與 manifest.json
+  x/
+  tiktok/
+    <username>/live/          # 完成的 LIVE MP4
+
+data/
+  profile/                    # Instagram 登入資料
+  control/                    # 個人設定、Bot 更新位置、傳送收據及冷卻狀態
+  watch/                      # 封存索引、下載佇列、平台健康及工作狀態
+  watchdog/                   # 告警與傳送狀態
+  x-accounts/                 # twscrape accounts.db
+  tiktok/                     # TikTok cookies
+  exports/                    # 選用 ZIP、申請與連結狀態
+logs/                         # 本機稽核與 GUI 日誌
+```
+
+Instagram 媒體檔名使用發佈時間的 JST；Story 無發佈時間時使用偵測時間。貼文與精選編號持久保存，caption 更新不會重送媒體。內容在平台刪除後，本機檔案仍保留；下載檔案沒有自動到期清理，已成功封存但被手動刪除的檔案不會自動補回。
+
+**備份應包含下載、完整狀態、登入資料及必要的 Docker volumes。** Local Bot API 與 TikTok 瀏覽器 profile 使用 named volumes；只複製 `data/` 不包含這些資料。`.env*`、cookies、資料庫、收據、匯出連結與狀態都屬私人資料，不要提交 Git 或附於 issue。
+
+ZIP 匯出只處理當時的本機封存，不代表來源平台歷史已完整抓取。下載網址持有者即可存取，請謹慎分享。權限、24 小時生命週期、磁碟需求及 Mac／NAS 的 Cloudflare Tunnel 設定見 [封存匯出說明](docs/archive-export.md)。
+
+## 日常維護與升級
 
 ```sh
+# 查看服務／追蹤日誌
+./igctl ps
+./igctl logs -f ig-watch ig-watchdog ig-telegram
+
+# 重新建置並建立更新後的服務
+./igctl up -d --build --force-recreate ig-watch ig-watchdog ig-telegram
+
+# 停止整套服務，保留 named volumes
 ./igctl down
 ```
 
-`igctl` combines `docker-compose.yml`, `compose.watch.yml`, and `compose.health.yml`. The resulting deployment runs the media watcher under a supervisor and keeps the independent watchdog and Telegram control service in separate containers.
+升級前先停止舊 watcher 與其他寫入相同資料的程序，私下備份 `data/`、`downloads/`、設定與 named volumes。不要使用 `down -v` 清理部署，也不要刪除 `.required`、封存索引或傳送收據來重試下載。
 
-## Telegram private menus
+舊版 Instagram 封存會在初始化時遷移至 `downloads/instagram/`，以 journal 記錄搬移進度；帳號目錄按數字 ID 維持穩定。遇到來源歸屬不明、symlink 或目的地衝突時會停止遷移，不覆寫檔案。升級期間保留舊帳號設定，不要自行搬移帳號目錄或刪除 `archive-layout.json` 及 marker。詳見 [既有下載遷移](docs/instagram-operations.md#upgrading-existing-downloads)。
 
-Send `/start` or `/menu` to your bot in a **private chat**. The command menu offers:
+### 診斷命令
 
-- **監看帳號** / **新增帳號**: add a username such as `alice` or `@alice`, or confirm
-  removing a subscription. `/add alice` is also supported.
-- **媒體通知**: select an account and independently enable/disable Story, post and
-  Highlight notifications. All three are enabled by default; local downloads continue.
-- **每日摘要**: disabled by default. When enabled, receive one personal summary per
-  Hong Kong calendar day at 20:00. If the service starts after that time, today's
-  summary is queued then. Account errors and recovery alerts remain enabled.
-- **我的狀態** / `/status`: view only your subscriptions and relevant incidents.
-  `/cancel` exits an account-entry prompt.
-
-The owner is `TELEGRAM_OWNER_USER_ID`, or the positive private-user
-`TELEGRAM_CHAT_ID` when the owner variable is omitted. If the old destination is a
-group (negative chat ID), explicitly configure the owner's **numeric user ID**.
-Add other approved IDs to `TELEGRAM_ALLOWED_USER_IDS=123456789,987654321` in
-`.env.telegram`, then recreate **ig-telegram**. Each user must start the bot privately
-before it can send them messages. Group messages and callbacks, unknown users, and
-callbacks whose private chat does not match the sender are ignored. The owner is
-always approved. Revoked users retain saved history but stop receiving messages and
-stop contributing targets to the active watch list.
-
-On first startup, `ig-telegram` imports the environment's target list into the owner's
-settings and migrates acknowledged Story IDs. New users start with an empty list.
-It persists choices under `data/control/`; changes reach the worker at its next
-settings refresh (normally within five seconds when idle, or after the current cycle).
-The worker keeps its normal Instagram scan interval. Settings survive restarts and
-are never overwritten by the initial environment list. An empty subscription list
-is valid and leaves the worker idle.
-
-Adding an account sends its currently available Stories, subject to your switches.
-Existing posts/Highlights download quietly. Historical posts/Highlights first found
-after a new subscription are also kept quiet using their publication time. Turning
-a notification switch back on does not replay already observed or queued content
-from the disabled period; only subsequent discoveries are eligible. This uses first
-detection time: content not observed until after re-enabling is a new discovery,
-even when its publication time is earlier. New subscriptions separately suppress
-historical posts/Highlights using publication time. Media already
-acknowledged for one user is not resent if another user fails. Telegram can still
-produce a duplicate if its acknowledgement is lost after delivery.
-
-Account-specific alerts go to the users subscribed to that account. Shared login,
-storage-capacity and service failures notify all approved users, but only the owner
-receives technical details. Other users receive a generic service-unavailable message
-(or a brief recovery message). Shared incident details in status queries and daily
-summaries are also restricted to the owner. The watchdog routes
-alerts through the control service; if that service or its polling heartbeat fails,
-it sends a separate direct fallback warning, with technical instructions only for the owner. A blocked recipient does not prevent
-other users from receiving replies or fallback alerts.
-
-Only **one** `ig-telegram` instance may poll a given bot token. An existing webhook
-is reported as a configuration error, never deleted automatically. A Telegram 429
-cooldown is persisted and shared between normal menu/media requests. The independent
-watchdog fallback has its own persisted cooldown. The bot uses the official
-[Telegram Bot API](https://core.telegram.org/bots/api#getupdates).
-
-To enable this feature on an existing deployment:
-
-```sh
-./igctl up -d --build --force-recreate ig-watch ig-watchdog ig-telegram
-```
-
-Compose enables `IG_TELEGRAM_CONTROL=1` by default. Set it to `0` in `.env` and
-recreate the stack to use the legacy environment-driven, single-destination delivery;
-the control container then stays idle and does not poll or change saved settings.
-Switching to legacy mode does not synchronize menu subscriptions back to `.env`.
-
-`data/control/settings.json` and `delivery.json`, plus their `.required` markers,
-protect personal settings, update offsets and delivery history. Do not delete them
-to retry a notification. Delivery state and `data/watch/telegram-events/` may contain
-signed media URLs and user IDs. Include `data/control/` in private backups, and keep
-it out of Git/support attachments. Account archives retain their existing locations.
-
-## Download an Instagram link
-
-In the bot's private chat, paste a post, Reel, Story, Highlight or Instagram share
-link. `/download <link>` and the **連結下載** menu entry are also available. Each
-message accepts up to ten links; each link is an independent durable job. Invalid
-or unavailable links are reported without discarding other valid jobs. This uses
-the existing approved-user list and saved Instagram login. Content must be
-accessible to that login. No separate login or extra bot token is needed.
-
-- A post/Reel downloads the whole carousel, in its original order; `img_index` and
-  tracking parameters do not limit the selection.
-- A Story URL downloads exactly the specified Story. An expired/deleted Story can
-  be returned from a complete manual cache, but cannot otherwise be recovered.
-- A Highlight URL downloads the whole accessible collection. Collection membership
-  is refreshed on each request, while complete media files are reused.
-- An account homepage prompts **加入 @account / 取消**. Only confirmation adds it to
-  that user's existing subscriptions; a homepage never triggers a bulk archive.
-- Repeating a link requests delivery again. Complete post/Story files are reused
-  after checking their size and signature; requests have independent delivery receipts.
-- Manual results bypass automatic Story/post/Highlight notification switches.
-  They do not automatically subscribe the requester to the source account.
-
-The worker finishes its current read/download, then gives queued manual jobs
-priority at the next safe boundary. Manual and background Instagram operations use
-one serialized browser profile. Menus and Telegram polling continue in a separate
-service. Background scans resume after due manual jobs, without losing their
-pagination or download checkpoints.
-
-Downloads choose the highest available resolution/bitrate. When a higher-quality
-DASH version has separate audio/video tracks, FFmpeg combines them with `-c copy`,
-without re-encoding. The worker image includes FFmpeg. Original media and captions
-are retained permanently under:
-
-```text
-downloads/instagram/manual/<username>/<post|story|highlight>/<content-id>/
-  001_<media-id>.jpg
-  002_<media-id>.mp4
-  manifest.json
-```
-
-Reels use the `post` directory. The complete manifest includes the source URL,
-caption and ordered file records. Partial-job metadata remains in `data/watch/manual/`.
-There is no automatic deletion of these downloaded files. Each source stream has a
-2,000,000,000-byte download ceiling, a five-minute transfer timeout, and up to three
-job attempts; larger/unavailable sources are reported. DASH source tracks and the
-merged file can coexist temporarily, so allow space for both.
-
-Telegram results are uploaded from local files, rather than asking Telegram to
-fetch Instagram's expiring CDN URLs. Photos/videos form albums of at most ten items,
-in order; a single item is sent normally. Oversized photos or rejected display
-formats can be sent as original documents, in separate document groups when needed.
-Before uploading, the controller probes the final local MP4 with ffprobe and supplies
-display width, height and duration to Telegram, accounting for rotation and pixel
-aspect ratio. It also extracts an upright JPEG preview (at most 320 pixels per
-side, preserving the display ratio) and uploads it as both thumbnail and cover
-for single videos and albums. This also applies to cached videos without
-re-encoding the original. If probing or preview extraction fails, the original
-group is sent as documents to preserve order and receipt boundaries. The
-controller image includes ffprobe and FFmpeg.
-The current cloud API file ceiling is 50 MB. Files above that ceiling stay local;
-other transferable media are sent and the bot reports **檔案過大，已下載但無法直接傳送**.
-This feature does not start a Local Bot API server or an external download website.
-
-Temporary fetch/download failures retry while complete files remain available for
-reuse. After retries, successfully downloaded items are still sent with a partial
-failure report. Telegram group acknowledgements are persisted individually. A
-network timeout or a restart during an in-flight upload is treated as uncertain:
-files stay local and the bot asks the user to check their chat; it does not blindly
-upload that group again. Reposting the link creates a new explicit request.
-Confirmed rate-limit rejections can retry after the shared Telegram cooldown.
-
-Settings/update offsets and manual requests are saved together in
-`data/control/settings.json`. The watcher owns `data/watch/manual/jobs/` and its
-cache index; the controller owns `data/control/manual-delivery.json` and its
-`.required` marker. Keep all of these in private backups. Do not delete receipt
-state to retry an upload. The controller's `/downloads` mount is read-only, and
-only the watcher writes media. No Instagram seen/read mutation is allowed.
-
-After upgrading, recreate the services so that FFmpeg and the read-only download
-mount are present:
-
-```sh
-./igctl up -d --build --force-recreate ig-watch ig-telegram ig-watchdog
-```
-
-## Configuration
-
-完整帳號封存 ZIP 匯出、24 小時 HTTPS 下載連結及 Mac／NAS 的 Cloudflare Tunnel 部署，見 [封存匯出說明](docs/archive-export.md)。
-
-| Variable | File | Required | Description |
-| --- | --- | --- | --- |
-| `IG_TARGET_USERNAMES` | `.env` | Unless legacy target is supplied | Comma-separated usernames; takes precedence over legacy variables |
-| `IG_TARGET_USERNAME` | `.env` | Legacy fallback | Single account username, used when the list is empty |
-| `IG_TARGET_USER_ID` | `.env` | No | Optional ID override in legacy single-account mode only |
-| `IG_CHECK_INTERVAL_SECONDS` | `.env` | No | Base polling interval; defaults to `300` |
-| `VNC_PASSWORD` | `.env` | For login | Password for the temporary noVNC session |
-| `NOVNC_BIND_ADDRESS` | `.env` | No | Host address for noVNC; defaults to `127.0.0.1` |
-| `NOVNC_PORT` | `.env` | No | Host port for noVNC; defaults to `6080` |
-| `IG_DATA_DIR` | `.env` | No | Host runtime-data directory; defaults to `./data` |
-| `IG_LOG_DIR` | `.env` | No | Host log directory; defaults to `./logs` |
-| `TELEGRAM_BOT_TOKEN` | `.env.telegram` | Yes | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | `.env.telegram` | Yes | Legacy/test destination; also the default owner ID when positive |
-| `TELEGRAM_OWNER_USER_ID` | `.env.telegram` | For group migrations | Owner numeric user ID; defaults to a positive `TELEGRAM_CHAT_ID` |
-| `TELEGRAM_ALLOWED_USER_IDS` | `.env.telegram` | No | Additional approved private users, comma-separated; recreate ig-telegram after changes |
-| `IG_TELEGRAM_CONTROL` | `.env` | No | Compose defaults to `1`; `0` retains legacy delivery |
-
-## Useful commands
-
-Run one Story fetch for a selected username without Telegram delivery (replace `alice`):
+對指定 Instagram 帳號執行一次 Story 擷取，不傳 Telegram：
 
 ```sh
 docker compose run --rm -e IG_TARGET_USERNAME=alice -e IG_TARGET_USER_ID= -e IG_TARGET_USERNAMES= ig-check node /app/src/fetch-story.mjs
 ```
 
-Run one complete media check and delivery cycle for all configured accounts:
+執行一次完整 Instagram 檢查與配送；請先停止使用同一 profile 的常駐 watcher：
 
 ```sh
+./igctl stop ig-watch
 ./igctl run --rm ig-watch node /app/src/watch-media.mjs --once
+./igctl up -d ig-watch
 ```
 
-Queue a watchdog-path test alert while the stack is running:
+測試 watchdog 告警路徑（會排入測試告警）：
 
 ```sh
 ./igctl exec ig-watchdog node /app/src/watchdog.mjs --self-test
 ```
 
-Run the local JavaScript syntax check:
+## 故障排除
+
+| 現象／日誌 | 檢查與處理 |
+| --- | --- |
+| `SESSION_INVALID` | 停止 `ig-watch`，重新執行登入步驟，完成後檢查 session 並啟動 watcher |
+| `BOOTSTRAP_TOKEN_ERROR`、GraphQL／schema 錯誤 | 查看日誌；Instagram 頁面或私有 API 可能已變更，必要時調整查詢 ID，避免反覆強制重試 |
+| Telegram 測試失敗 | 檢查 `.env.telegram` 的 token、chat ID，以及使用者是否已向 Bot 傳送訊息；確認 Local Bot API 設定及遷移已完成 |
+| Bot 不回應 | 確認使用私人聊天、數字使用者 ID 在白名單、`ig-telegram` 健康，且沒有其他 poller 或既有 webhook |
+| X 回補一直等待 | 啟動 `x-watch`；再確認有效的 `accounts.db` 與 X 指南中的狀態命令 |
+| TikTok 403／CAPTCHA | 依 TikTok 指南檢查 VPN、cookies 與互動登入；catalog 與登入容器不可同時使用共用 profile |
+| noVNC 無法連線 | 檢查綁定位址、連接埠、防火牆及 `logs/`；遠端使用 SSH tunnel |
+| 有 Telegram 訊息，但找不到本機檔案 | `STORY_MEDIA_SENT` 只代表配送；確認 `STORY_ARCHIVE_SAVED`／`CATALOG_MEDIA_SAVED` 與主機實際掛載 |
+| 磁碟、權限、歷史／marker 錯誤 | 保留狀態及備份，處理根因；不要以刪除索引或 marker 的方式略過保護 |
+
+Instagram 可恢復的擷取、下載及配送錯誤連續三次才通知一次，前兩次安靜重試；成功後重設計數，已告警問題才發恢復通知。登入、儲存及資料完整性問題立即告警。共用登入失效會暫停所有 Instagram 帳號；個別帳號錯誤則獨立退避。
+
+一般使用者只看到與自己相關的狀態；共用服務故障的技術細節限擁有者。watchdog 在控制服務失效時可直接發送備援警告。
+
+## 開發驗證
 
 ```sh
 npm ci
 npm test
+npm run test:export
+./igctl config --quiet
 ```
 
-## Runtime data
+`npm test` 包含 JavaScript 語法檢查與 Node 測試；`test:export` 執行 Python 匯出測試。平台專屬驗證見各整合指南。離線測試通過不代表真實登入、平台介面、VPN、直播或 Telegram 大檔傳送已驗證。
 
-The following paths contain private or machine-specific data and are excluded from Git and Docker build contexts:
+網路防護以允許清單限制 Instagram 唯讀請求，阻擋已知 Story seen／read mutation 及非預期寫入。noVNC 預設僅綁 localhost；傳統 VNC 驗證只使用密碼前八個字元，應維持 localhost 並使用 SSH tunnel。Chromium 容器目前使用 `--no-sandbox`，部署時請使用專用環境。若憑證曾外洩，應立即更換。
 
-- `data/profile/` — Instagram cookies, local storage, history, and browser databases
-- `data/watch/` — delivery history, pending media, health, and supervisor state
-- `data/watchdog/` — watchdog issues, alert outbox, and delivery state
-- `data/control/` — personal Telegram settings, update offsets, notification queues and API cooldowns
-- `logs/` — local JSON audit and GUI service logs
-- `.env` and `.env.telegram` — local configuration and credentials
+## 詳細文件與參考
 
-Back up `data/` privately if delivery history and session persistence matter to you. Never publish it or attach it to a GitHub issue.
+| 文件 | 內容 |
+| --- | --- |
+| [Instagram 操作與封存細節](docs/instagram-operations.md) | 完整封存規則、遷移、私人選單、手動下載與傳送狀態；保留原英文技術說明 |
+| [X／Twitter 整合](docs/x-integration.md) | 啟用、twscrape 帳號池、歷史回補與故障恢復 |
+| [TikTok 整合](docs/tiktok-integration.md) | LIVE、VPN、cookies、Local Bot API 遷移、catalog 與登入 |
+| [封存匯出](docs/archive-export.md) | ZIP、HTTPS 下載、Cloudflare Tunnel、Mac／NAS 部署與移轉 |
 
-## How it works
+參考專案：[tiktok-live-recorder](https://github.com/Michele0303/tiktok-live-recorder)、[twscrape](https://github.com/vladkens/twscrape)、[TelegramSocialDownloader](https://github.com/Senachi124/TelegramSocialDownloader)。另整合本機 TikTok-Recorder、ig-story-browser 與 x_download_tool 的相關實作。
 
-```text
-Instagram session profile
-          |
-          v
-  watch-supervisor
-          |
-          v
-    watch-media  -----> durable events -----> telegram-control -----> private Telegram
-          |                                     |
-          |                                  personal menus
-          |
-          +-----> durable state + health files
-                         |
-                         v
-                      watchdog -----> Telegram alerts
-```
-
-The browser worker bootstraps an authenticated Instagram page and performs one allow-listed Story GraphQL query per configured numeric account ID, sequentially. Profile post scans accept an original producer or an explicitly confirmed coauthor;
-invited collaborators and unrelated accounts are rejected. The network guard blocks known seen/read operations and rejects other Instagram write requests. Story media URLs are passed through a private temporary file, delivered to Telegram, and never written to the audit log.
-
-## Troubleshooting
-
-Instagram 的 Story、貼文／精選查詢、媒體下載及傳送遇到可恢復錯誤時，連續失敗三次才列為異常並通知一次；前兩次安靜重試。成功後會重設次數，只有已發出告警的問題才發恢復通知。計數按帳號及工作分開並保存於監控狀態；Telegram 限流等待本身不算新失敗。登入失效、磁碟／權限及資料完整性問題仍立即告警。TikTok 的同類規則見 [TikTok integration](docs/tiktok-integration.md)。
-
-### `SESSION_INVALID`
-
-Run the temporary login container again. Instagram may have expired the session or requested a checkpoint.
-
-### `BOOTSTRAP_TOKEN_ERROR` or GraphQL/schema errors
-
-Instagram likely changed its page data, private GraphQL request, or response schema. Review the logs before retrying; repeated automated retries can make account challenges more likely.
-
-### Telegram test fails
-
-Confirm that the bot token and chat ID are correct and that the destination user or group has already started or added the bot. Credentials belong in `.env.telegram`, not `.env`.
-
-### noVNC is unreachable
-
-Check `NOVNC_BIND_ADDRESS`, `NOVNC_PORT`, host firewall rules, and the files under `logs/`. Do not expose port 6080 directly to the public internet.
-
-## Security notes
-
-- The default noVNC port binds only to localhost.
-- The login container rejects the example password and passwords shorter than 8 characters. [Traditional VNC authentication only uses the first 8 characters](https://github.com/LibVNC/x11vnc/blob/master/doc/OPTIONS.md), so the localhost binding and SSH tunnel are the important protections.
-- Browser profiles, logs, runtime state, and all real environment files are ignored by Git.
-- Docker build contexts exclude the same sensitive paths.
-- The containers currently run Chromium with `--no-sandbox`; use a dedicated host and do not run untrusted workloads alongside this stack.
-- Rotate any credential immediately if it is accidentally committed, even if the commit is later deleted.
-
-## Project status
-
-This project is an experimental personal automation tool. Expect maintenance when Instagram changes its private web APIs. There is currently no license; public visibility does not grant permission to copy, modify, or redistribute the code.
-
-Telegram 手動下載：直接傳送 TikTok `/@帳號/video/ID`、`/@帳號/photo/ID` 或 `vm.tiktok.com`／`vt.tiktok.com`／`tiktok.com/t/` 分享連結，即可排隊下載並回傳媒體。需要啟動 `tiktok-catalog` 及 Telegram 服務；不需要訂閱該帳號。下載失敗會自動重試，三次失敗後通知申請者。
+此專案為實驗性個人自動化工具，需要隨平台介面變動維護。目前沒有專案整體授權；內含 TikTok 程式碼的授權見 [tiktok/LICENSE](tiktok/LICENSE)。
