@@ -42,7 +42,7 @@ function listMenu(user, page = 0) {
 
 // Mutate settings and enqueue replies in one durable transaction with the update offset.
 // Desired values and subscription generations make repeated/stale buttons harmless.
-export function applyUpdate(settings, update, now = Date.now(), statusText = () => '狀態暫時無法取得。', exportEnabled = false) {
+export function applyUpdate(settings, update, now = Date.now(), statusText = () => '狀態暫時無法取得。', exportEnabled = false, exportAccounts) {
   if (!Number.isSafeInteger(update?.update_id) || update.update_id < settings.offset) return false;
   const callback = update.callback_query;
   const message = callback?.message || update.message;
@@ -57,7 +57,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     settings.replies[`ack:${update.update_id}`] = { method: 'answerCallbackQuery', body: { callback_query_id: callback.id }, userId: id, at: now };
     const parts = String(callback.data || '').split(':');
     const [action, name, kind, value, generation] = parts;
-    if (action === 'ex') result = exportCallback(settings, id, callback.data, update.update_id, now, exportEnabled);
+    if (action === 'ex') result = exportCallback(settings, id, callback.data, update.update_id, now, exportEnabled, exportAccounts);
     else if (action === 'tt') result = tikTokCallback(user, callback.data, now);
     else if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
     else if (action === 'menu' || (action === 'ig' && name === 'menu')) { delete user.waiting; result = mainMenu(user); }

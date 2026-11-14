@@ -13,7 +13,7 @@ import { PersonalDelivery } from './telegram-delivery.mjs';
 import { TelegramClient } from './telegram-client.mjs';
 import { XDelivery } from './x-delivery.mjs';
 import { formatXHistory, compactXHistory } from './x-status.mjs';
-import { ingestExportReports, exportServiceReady } from './archive-export.mjs';
+import { ingestExportReports, exportServiceReady, exportAccountNames } from './archive-export.mjs';
 
 export function describeUser(settings, id, stateDir, watchdogDir = null) {
   let readErrors = 0;
@@ -148,24 +148,31 @@ export async function run({ env = process.env, args = process.argv } = {}) {
           if (!Array.isArray(updates)) throw Error('TELEGRAM_UPDATES_INVALID');
           for (const update of updates) {
             const candidate = structuredClone(settings);
-            if (applyUpdate(candidate, update, Date.now(), describe, env.ARCHIVE_EXPORT_ENABLED === '1' && exportServiceReady(env.EXPORT_DIR || '/exports'))) {
+            if (applyUpdate(candidate, update, Date.now(), describe, env.ARCHIVE_EXPORT_ENABLED === '1' && exportServiceReady(env.EXPORT_DIR || '/exports'),
+              platform => exportAccountNames(candidate, platform, { root: env.IG_ARCHIVE_DIR || '/downloads', stateDir }))) {
               atomic(settingsFile(env), candidate); settings = candidate;
             }
           }
           lastPollAt = Date.now(); pollOk = true;
-          if (env.ARCHIVE_EXPORT_ENABLED === '1') {
-            let candidate = structuredClone(settings), imported = false;
-            try { imported = ingestExportReports(candidate, env.EXPORT_DIR || '/exports'); }
-            catch { log('ARCHIVE_EXPORT_REPORT_FAILED', { reason: 'EXPORT_STATE_OR_IO_ERROR' }); }
-            if (imported) { atomic(settingsFile(env), candidate); settings = candidate; }
-          }
-          await flushReplies(settings, client, persistSettings, { stopping: () => stopping, log });
         } catch (error) {
           if (stopping) return;
           if (!/^TELEGRAM_(?:ERROR_\d+|NETWORK_OR_RESPONSE_ERROR|RETRY_WAIT|UPDATES_INVALID)$/.test(error.message)) throw error;
           pollOk = false; log('TELEGRAM_CONTROL_POLL_FAILED', { reason: /^TELEGRAM_[A-Z0-9_]+$/.test(error.message) ? error.message : 'CONTROL_STATE_OR_IO_ERROR' });
           if (!args.includes('--once')) await wait(5000);
         }
+      } while (!stopping && !args.includes('--once'));
+    }
+    async function replyDispatch() {
+      do {
+        if (env.ARCHIVE_EXPORT_ENABLED === '1') {
+          const candidate = structuredClone(settings);
+          let imported = false;
+          try { imported = ingestExportReports(candidate, env.EXPORT_DIR || '/exports'); }
+          catch { log('ARCHIVE_EXPORT_REPORT_FAILED', { reason: 'EXPORT_STATE_OR_IO_ERROR' }); }
+          if (imported) { atomic(settingsFile(env), candidate); settings = candidate; }
+        }
+        await flushReplies(() => settings, client, persistSettings, { stopping: () => stopping, log });
+        if (!args.includes('--once')) await wait(250);
       } while (!stopping && !args.includes('--once'));
     }
     async function dispatch() {
@@ -199,7 +206,8 @@ export async function run({ env = process.env, args = process.argv } = {}) {
         if (!args.includes("--once")) await wait(1000);
       } while (!stopping && !args.includes("--once"));
     }
-    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch(), tikTokDispatch('notice'), tikTokDispatch('video'), tikTokDispatch('content'), tikTokDispatch('story')]);
+    if (args.includes('--once')) await poll();
+    await Promise.all([...(args.includes('--once') ? [] : [poll()]), replyDispatch(), dispatch(), manualDispatch(), xDispatch(), tikTokDispatch('notice'), tikTokDispatch('video'), tikTokDispatch('content'), tikTokDispatch('story')]);
     if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk && ttOk.video && ttOk.notice && ttOk.content && ttOk.story ? 0 : 1;
   } finally {
     stopping = true; signal.abort(); clearInterval(heartbeat);

@@ -341,6 +341,35 @@ test('complete controller persists update offsets and menus across restart using
   assert.ok(sent.every(body => body.chat_id === '200')); assert.ok(methods.includes('answerCallbackQuery'));
 });
 
+test('export replies are delivered while getUpdates is still waiting for new messages', async t => {
+  const { run } = await import('../src/telegram-control.mjs');
+  const f = fixture(t), args = [], exports = path.join(f.dir, 'exports');
+  fs.mkdirSync(exports);
+  atomic(path.join(exports, 'health.json'), { at: Date.now() });
+  atomic(path.join(exports, 'reports.json'), { ['b'.repeat(24)]: { userId: '200', text: 'Export result during polling', rows: [] } });
+  let releasePoll, delivered, pollWaiting = false;
+  const arrived = new Promise(resolve => { delivered = resolve; });
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const method = String(url).split('/').at(-1), body = JSON.parse(options.body);
+    let result = true;
+    if (method === 'getWebhookInfo') result = { url: '' };
+    if (method === 'getUpdates') {
+      pollWaiting = true;
+      result = await new Promise(resolve => { releasePoll = resolve; });
+      pollWaiting = false;
+    }
+    if (method === 'sendMessage' && body.text === 'Export result during polling') delivered(pollWaiting);
+    return { ok: true, json: async () => ({ ok: true, result }) };
+  });
+  const running = run({ env: { ...f.env, TELEGRAM_BOT_TOKEN: '123:abc', IG_STATE_DIR: f.state, IG_ARCHIVE_DIR: f.root, IG_WATCHDOG_DIR: path.join(f.dir, 'watchdog'), ARCHIVE_EXPORT_ENABLED: '1', EXPORT_DIR: exports }, args });
+  let timer;
+  try {
+    assert.equal(await Promise.race([arrived, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('reply waited for polling')), 2500); })]), true);
+  } finally {
+    clearTimeout(timer); args.push('--once'); releasePoll?.([]); await running;
+  }
+});
+
 test('watchdog fallback isolates DOMException timeouts and propagates durable-write failures', async () => {
   const { sendControlFallback } = await import('../src/telegram-fallback.mjs');
   const calls = [], state = {};

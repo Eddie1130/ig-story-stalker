@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { applyUpdate } from '../src/telegram-menu.mjs';
-import { exportCallback, exportGeneration, ingestExportReports, validateExportSettings } from '../src/archive-export.mjs';
+import { exportCallback, exportGeneration, exportAccountNames, ingestExportReports, validateExportSettings } from '../src/archive-export.mjs';
 import { flushReplies } from '../src/telegram-replies.mjs';
 
 const settings = () => ({ version: 1, ownerId: '1', allowedIds: ['1', '2'], offset: 0, replies: {}, users: { '1': { daily: false, targets: {} }, '2': { daily: false, targets: {}, xTargets: { alice: { generation: 'gen-1' } } } } });
@@ -61,5 +61,37 @@ test('private-chat and allowlist restrictions also protect export callback routi
   for (const platform of ['constructor', '__proto__', 'toString']) {
     assert.doesNotThrow(() => exportCallback(s, '2', `ex:preview:${platform}:alice`, 1, 0, true));
     assert.equal(s.exportRequests, undefined);
+  }
+});
+
+test('platform selection immediately returns the account list without a queued request or holding message', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'export-accounts-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'x', 'archived'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'x', 'manual'));
+  const s = settings();
+  const accounts = p => exportAccountNames(s, p, { root: dir });
+  applyUpdate(s, callback('ex:owner:x:0', 1, 1), Date.now(), undefined, true, accounts);
+  assert.equal(s.exportRequests, undefined);
+  const reply = s.replies['reply:1'].body;
+  assert.equal(reply.text, '管理員：選擇要匯出的帳號');
+  assert.deepEqual(reply.reply_markup.inline_keyboard.flat().map(b => b.text), ['@alice', '@archived', '⬅️ 主選單']);
+  assert.ok(!JSON.stringify(s.replies).includes('正在處理匯出操作'));
+  applyUpdate(s, callback('ex:owner:x:0', 2, 2), Date.now(), undefined, true, accounts);
+  assert.match(s.replies['reply:2'].body.text, /沒有.*權限/);
+});
+
+test('reply receipts and retries update the newest settings if polling replaced state during a send', async () => {
+  for (const failure of [false, true]) {
+    let current = settings();
+    current.replies.one = { method: 'sendMessage', userId: '2', body: { chat_id: '2', text: 'reply' } };
+    await flushReplies(() => current, { call: async () => {
+      current = structuredClone(current);
+      current.replies.two = { method: 'sendMessage', userId: '2', body: { chat_id: '2', text: 'next' } };
+      if (failure) throw Error('TELEGRAM_NETWORK_OR_RESPONSE_ERROR');
+    } }, () => {});
+    assert.ok(current.replies.two);
+    if (failure) assert.equal(current.replies.one.failures, 1);
+    else assert.equal(current.replies.one, undefined);
   }
 });
