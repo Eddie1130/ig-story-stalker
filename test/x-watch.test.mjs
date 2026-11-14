@@ -423,3 +423,22 @@ test('multiple legacy automatic queues consolidate without widening a running se
   assert.equal(second.status,'cancelled');assert.equal(second.reason,'X_GAP_MERGED');
   assert.equal(running.status,'working');assert.equal(running.end,'2023-11-10');
 });
+
+test('live notifications bypass history backlog while reserving history progress',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  for(let i=1;i<=10;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:1,recipients:[]};
+  for(let i=11;i<=16;i++)a.pending[`post:${i}`]={event:{statusId:String(i)},at:2,recipients:[{userId:'100',generation:'one'}]};
+  await f.watcher.archivePending(1000);
+  assert.deepEqual(f.saves.map(e=>e.statusId),['11','12','13','14','1']);
+  assert.equal(events(f).filter(e=>e.type==='post').length,4);
+  await f.watcher.archivePending(2000);
+  assert.deepEqual(f.saves.slice(5).map(e=>e.statusId),['15','16','2','3','4']);
+});
+test('backed-off live notifications do not block eligible live or history work',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  a.pending['post:1']={event:{statusId:'1'},at:1,recipients:[{userId:'100'}],retryAt:10000};
+  a.pending['post:2']={event:{statusId:'2'},at:2,recipients:[]};
+  a.pending['post:3']={event:{statusId:'3'},at:3,recipients:[{userId:'100'}]};
+  await f.watcher.archivePending(1000);
+  assert.deepEqual(f.saves.map(e=>e.statusId),['3','2']);
+});

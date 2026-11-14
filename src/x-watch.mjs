@@ -219,9 +219,14 @@ export class XWatcher {
     }
   }
   async archivePending(now) {
-    // Fair across targets and failures; delayed entries do not consume the budget.
-    const candidates=this.names().flatMap(name=>Object.entries(this.account(name).pending).map(([key,p])=>({name,key,p})))
-      .filter(({p})=>now>=(p.retryAt||0)).sort((a,b)=>(a.p.lastAttempt||0)-(b.p.lastAttempt||0)||a.p.at-b.p.at).slice(0,5);
+    // Prioritize live notifications; reserve one of five slots for quiet backfill.
+    // Retry deadlines and oldest-attempt ordering still apply within each queue.
+    const eligible=this.names().flatMap(name=>Object.entries(this.account(name).pending).map(([key,p])=>({name,key,p})))
+      .filter(({p})=>now>=(p.retryAt||0)).sort((a,b)=>(a.p.lastAttempt||0)-(b.p.lastAttempt||0)||a.p.at-b.p.at);
+    const live=eligible.filter(({p})=>p.recipients.length>0);
+    const quiet=eligible.filter(({p})=>p.recipients.length===0);
+    const liveCount=Math.min(live.length,quiet.length?4:5);
+    const candidates=[...live.slice(0,liveCount),...quiet.slice(0,5-liveCount)];
     for(const {name,key,p} of candidates) {
         const a=this.account(name);p.lastAttempt=now;
         for(const job of Object.values(this.state.history))if(job.username===name&&job.archiveKeys?.includes(key))job.archiveUpdatedAt=now;
