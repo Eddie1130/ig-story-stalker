@@ -294,9 +294,12 @@ acknowledged for one user is not resent if another user fails. Telegram can stil
 produce a duplicate if its acknowledgement is lost after delivery.
 
 Account-specific alerts go to the users subscribed to that account. Shared login,
-storage-capacity and service failures go to all approved users. The watchdog routes
+storage-capacity and service failures notify all approved users, but only the owner
+receives technical details. Other users receive a generic service-unavailable message
+(or a brief recovery message). Shared incident details in status queries and daily
+summaries are also restricted to the owner. The watchdog routes
 alerts through the control service; if that service or its polling heartbeat fails,
-it sends a separate direct fallback warning. A blocked recipient does not prevent
+it sends a separate direct fallback warning, with technical instructions only for the owner. A blocked recipient does not prevent
 other users from receiving replies or fallback alerts.
 
 Only **one** `ig-telegram` instance may poll a given bot token. An existing webhook

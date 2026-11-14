@@ -58,10 +58,10 @@ async function main() {
         // The command service also delivers notifications. An independent direct
         // fallback must remain available when that service itself has stopped.
         state.controlFallbackSent ||= {};
-        let recipients;
-        try { recipients = readSettings(settingsFile(process.env)).allowedIds; }
+        let recipients, ownerId = process.env.TELEGRAM_OWNER_USER_ID || chatId;
+        try { const settings = readSettings(settingsFile(process.env)); recipients = settings.allowedIds; ownerId = settings.ownerId; }
         catch { recipients = [process.env.TELEGRAM_OWNER_USER_ID || chatId].filter(id => /^[1-9]\d*$/.test(id)); }
-        await sendControlFallback({ recipients, state, token, signal: abort.signal, persist, log });
+        await sendControlFallback({ recipients, ownerId, state, token, signal: abort.signal, persist, log });
       }
     }
     // Oldest queued alerts first, including incidents resolved while Telegram was down.

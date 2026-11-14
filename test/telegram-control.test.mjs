@@ -334,9 +334,10 @@ test('complete controller persists update offsets and menus across restart using
   await run({ env, args: ['--once'] });
   let saved = readSettings(settingsFile(env));
   assert.ok(saved.users['200'].targets.charlie); assert.equal(saved.users['200'].daily, true); assert.equal(saved.offset, 4);
-  const before = sent.filter(body => body.reply_markup).length;
+  const menuReplies = () => sent.filter(body => body.reply_markup && !body.text?.startsWith('每日摘要（')).length;
+  const before = menuReplies();
   await run({ env, args: ['--once'] });
-  saved = readSettings(settingsFile(env)); assert.equal(saved.offset, 4); assert.equal(sent.filter(body => body.reply_markup).length, before);
+  saved = readSettings(settingsFile(env)); assert.equal(saved.offset, 4); assert.equal(menuReplies(), before);
   assert.ok(sent.every(body => body.chat_id === '200')); assert.ok(methods.includes('answerCallbackQuery'));
 });
 
@@ -390,4 +391,62 @@ test('status commands and refresh callbacks offer a fresh status button',t=>{
   f.delivery.daily(Date.UTC(2026,10,14,12),describe);
   const summary=Object.values(f.delivery.state.pending).find(task=>task.type==='summary');
   assert.equal(summary.body.reply_markup.inline_keyboard[0][0].callback_data,'status');
+});
+
+test('shared incidents reveal details only to owner, including persisted retries and recovery', async t => {
+  const f = fixture(t), sent = [];
+  for (const kind of ['error', 'recovery']) {
+    const event = { version: 1, type: 'alert', id: kind, kind, at: 2000, username: 'alice', issueKey: 'target:alice:nas-storage', reason: 'NAS_ENOSPC', text: 'NAS_ENOSPC /private/internal' };
+    f.delivery.ingest(event);
+    // Simulate an old queued body containing the original detailed message.
+    for (const task of Object.values(f.delivery.state.pending)) task.body.text = event.text;
+    f.delivery.persist();
+    const restarted = new PersonalDelivery({ dir: f.control, stateDir: f.state, settings: () => f.settings });
+    await restarted.drain({ call: async (_, body) => sent.push(structuredClone(body)) });
+    const pair = sent.slice(-2);
+    assert.equal(pair.find(body => body.chat_id === '100').text, event.text);
+    const publicText = pair.find(body => body.chat_id === '200').text;
+    assert.doesNotMatch(publicText, /NAS_ENOSPC|private|alice/);
+    assert.match(publicText, kind === 'recovery' ? /服務已恢復/ : /稍後再試/);
+    f.delivery = restarted;
+  }
+  f.delivery.ingest({ version: 1, type: 'alert', id: 'account', kind: 'error', at: 3000, username: 'alice', issueKey: 'target:alice:fetch', reason: 'FETCH_TIMEOUT', text: 'account detail' });
+  await f.delivery.drain({ call: async (_, body) => sent.push(body) });
+  assert.equal(sent.at(-1).text, 'account detail');
+  assert.equal(sent.at(-1).chat_id, '100');
+});
+
+test('watchdog fallback keeps container instructions private to owner', async () => {
+  const { sendControlFallback } = await import('../src/telegram-fallback.mjs');
+  const sent = [];
+  await sendControlFallback({ recipients: ['100', '200'], ownerId: '100', state: {}, token: 'test', signal: new AbortController().signal, persist() {}, log() {},
+    fetchImpl: async (_, request) => { sent.push(JSON.parse(request.body)); return { ok: true, json: async () => ({ ok: true }) }; } });
+  assert.match(sent[0].text, /ig-telegram/);
+  assert.match(sent[1].text, /聯絡管理員/);
+  assert.doesNotMatch(sent[1].text, /watchdog|ig-telegram|容器/);
+});
+
+test('status and daily-summary description hide shared incident details from other users', async t => {
+  const f = fixture(t);
+  const { describeUser } = await import('../src/telegram-control.mjs');
+  atomic(path.join(f.state, 'monitor/issues.json'), { 'shared-session': { active: true, reason: 'SESSION_INVALID' }, 'target:alice:nas-storage': { active: true, reason: 'NAS_ENOSPC', usernames: ['alice'] } });
+  f.settings.users['200'].targets.alice = subscription(1000);
+  assert.match(describeUser(f.settings, '100', f.state), /SESSION_INVALID/);
+  const description = describeUser(f.settings, '200', f.state);
+  assert.doesNotMatch(description, /SESSION_INVALID|NAS_ENOSPC|shared-session|nas-storage/);
+  assert.match(description, /聯絡管理員/);
+});
+
+test('pre-upgrade persisted summary and status replies are refreshed before retry', async t => {
+  const f = fixture(t);
+  const { refreshQueuedDescriptions, describeUser } = await import('../src/telegram-control.mjs');
+  f.delivery.state.pending.old = { type: 'summary', userId: '200', body: { text: '每日摘要（香港時間 20:00）\nSESSION_INVALID' } };
+  f.settings.replies.old = { method: 'sendMessage', userId: '200', body: { text: '📊 你的監看狀態\nSESSION_INVALID' } };
+  f.delivery.persist(); atomic(settingsFile(f.env), f.settings);
+  const settings = readSettings(settingsFile(f.env));
+  const delivery = new PersonalDelivery({ dir: f.control, stateDir: f.state, settings: () => settings });
+  refreshQueuedDescriptions(delivery, settings, id => describeUser(settings, id, f.state));
+  assert.doesNotMatch(delivery.state.pending.old.body.text, /SESSION_INVALID/);
+  assert.doesNotMatch(settings.replies.old.body.text, /SESSION_INVALID/);
+  assert.match(settings.replies.old.body.text, /你的監看狀態/);
 });

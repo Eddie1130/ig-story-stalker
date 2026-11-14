@@ -1,6 +1,7 @@
+import { serviceUnavailableText } from './telegram-settings.mjs';
 import { telegramApiBase } from './telegram-endpoint.mjs';
 // Independent watchdog path: a blocked recipient must not suppress other users.
-export async function sendControlFallback({ recipients, state, token, signal, persist, log, fetchImpl = fetch }) {
+export async function sendControlFallback({ recipients, ownerId, state, token, signal, persist, log, fetchImpl = fetch }) {
   state.controlFallbackSent ||= {};
   state.controlFallbackUserRetry ||= {};
   if (Date.now() < (state.controlFallbackRetryAt || 0)) return;
@@ -16,7 +17,7 @@ export async function sendControlFallback({ recipients, state, token, signal, pe
       const response = await fetchImpl(`${telegramApiBase()}/bot${token}/sendMessage`, {
         method: 'POST', signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]),
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: id, text: 'IG Telegram 控制服務已失聯，選單與通知可能暫停。獨立 watchdog 仍在運作，請檢查 ig-telegram 容器。' }),
+        body: JSON.stringify({ chat_id: id, text: id === ownerId ? 'IG Telegram 控制服務已失聯，選單與通知可能暫停。獨立 watchdog 仍在運作，請檢查 ig-telegram 容器。' : serviceUnavailableText }),
       });
       const data = await response.json();
       accepted = response.ok && data.ok === true;

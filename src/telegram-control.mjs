@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { atomic, load, log } from './error-monitor.mjs';
-import { settingsFile, initializeSettings } from './telegram-settings.mjs';
+import { settingsFile, initializeSettings, isSystemAlert, serviceUnavailableText } from './telegram-settings.mjs';
 import { eventDirectory } from './telegram-events.mjs';
 import { applyUpdate } from './telegram-menu.mjs';
 import { PersonalDelivery } from './telegram-delivery.mjs';
@@ -84,11 +84,22 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
   const issues = { ...read(path.join(stateDir, 'monitor/issues.json'), {}), ...(watchdogDir ? read(path.join(watchdogDir, 'issues.json'), {}) : {}) };
   const targetIds = new Set(targets.filter(t => t && names.includes(t.username)).map(t => t.target));
   const relevant = Object.entries(issues).filter(([key, v]) => v?.active && (!key.startsWith('target:') || targetIds.has(v.target) || v.usernames?.some(name => names.includes(name)) || names.some(name => key.startsWith(`target:${name}:`))));
-  lines.push('', '🔎 系統狀態', `目前異常：${relevant.length}`, ...relevant.slice(0, 6).map(([key, v]) => `${key}：${v.reason}`));
-  if (readErrors) lines.push(`有 ${readErrors} 份執行狀態讀取失敗，請檢查監控日誌。`);
+  const visibleIssues = relevant.slice(0, 6).map(([key, v]) => id !== settings.ownerId && isSystemAlert({ ...v, issueKey: key, username: /^target:([^:]+):/.exec(key)?.[1] }) ? serviceUnavailableText : `${key}：${v.reason}`);
+  lines.push('', '🔎 系統狀態', `目前異常：${relevant.length}`, ...new Set(visibleIssues));
+  if (readErrors) lines.push(id === settings.ownerId ? `有 ${readErrors} 份執行狀態讀取失敗，請檢查監控日誌。` : serviceUnavailableText);
   if (health && (!Number.isFinite(health.at) || Date.now() - health.at > 120000)) lines.push('監看程序心跳已過期，顯示的是先前紀錄。');
   lines.push(`查詢時間：${new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Hong_Kong', dateStyle: 'short', timeStyle: 'medium', hour12: false }).format(new Date())}（香港）`);
   return lines.join('\n').slice(0, 3400);
+}
+
+// Refresh pre-upgrade status snapshots before retrying persisted messages.
+export function refreshQueuedDescriptions(delivery, settings, describe) {
+  for (const task of Object.values(delivery.state.pending)) {
+    if (task.type === 'summary') task.body.text = `每日摘要（香港時間 20:00）\n${describe(task.userId)}`;
+  }
+  for (const reply of Object.values(settings.replies)) {
+    if (reply.method === 'sendMessage' && reply.body?.text?.startsWith('📊 你的監看狀態')) reply.body.text = describe(reply.userId);
+  }
 }
 
 export async function run({ env = process.env, args = process.argv } = {}) {
@@ -118,6 +129,8 @@ export async function run({ env = process.env, args = process.argv } = {}) {
   const ttOk = { video: true, notice: true, content: true, story: true };
   const persistSettings = () => atomic(settingsFile(env), settings);
   const describe = id => describeUser(settings, id, stateDir, env.IG_WATCHDOG_DIR || '/app/watchdog-state');
+  refreshQueuedDescriptions(delivery, settings, describe);
+  delivery.persist(); persistSettings();
   const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk && ttOk.video && ttOk.notice && ttOk.content && ttOk.story, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
   const heartbeat = setInterval(health, 15000);
   try {

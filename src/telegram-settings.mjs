@@ -79,9 +79,16 @@ export function targetConfigs(s) {
 export function subscribed(s, id, username) {
   return s.allowedIds.includes(id) ? userTarget(s.users[id], username) : undefined;
 }
-export function alertRecipients(s, alert) {
+export const serviceUnavailableText = '服務暫時無法使用，請稍後再試；如持續無法使用，請聯絡管理員。';
+export function isSystemAlert(alert) {
   // Storage/session/service incidents are global even if emitted while processing an account.
   const issueKey = (alert.issueKey || '').replace(/^target:[^:]+:/, '');
-  const system = !alert.username || /^(?:NAS_(?:ENOSPC|EDQUOT|EIO|EROFS)|SESSION_|HEARTBEAT_|SUPERVISOR_|WORKER_)/.test(alert.reason || '') || /^(?:shared-session|worker-|watchdog-|supervisor|nas-storage)/.test(issueKey);
-  return s.allowedIds.filter(id => system || (alert.usernames?.length ? alert.usernames : [alert.username]).some(name => subscribed(s, id, name)));
+  return !alert.username || /^(?:NAS_(?:ENOSPC|EDQUOT|EIO|EROFS)|SESSION_|HEARTBEAT_|SUPERVISOR_|WORKER_)/.test(alert.reason || '') || /^(?:shared-session|worker-|watchdog-|supervisor|nas-storage)/.test(issueKey);
+}
+export function alertText(s, id, alert) {
+  if (id === s.ownerId || !isSystemAlert(alert)) return alert.text;
+  return alert.kind === 'recovery' ? '服務已恢復，可以繼續使用。如仍有問題，請聯絡管理員。' : serviceUnavailableText;
+}
+export function alertRecipients(s, alert) {
+  return s.allowedIds.filter(id => isSystemAlert(alert) || (alert.usernames?.length ? alert.usernames : [alert.username]).some(name => subscribed(s, id, name)));
 }

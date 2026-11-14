@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomic, load } from './error-monitor.mjs';
-import { userTarget, subscribed, alertRecipients, validUsername, kinds } from './telegram-settings.mjs';
+import { userTarget, subscribed, alertRecipients, alertText, validUsername, kinds } from './telegram-settings.mjs';
 import { mediaRequest, validMediaUrl } from './story-media.mjs';
 
 const object = v => v && typeof v === 'object' && !Array.isArray(v);
@@ -42,7 +42,7 @@ export class PersonalDelivery {
       if (typeof event.text !== 'string' || event.text.length > 3500 || typeof event.id !== 'string') throw Error('TELEGRAM_ALERT_INVALID');
       if (event.kind === 'status') return; // Superseded by each user's daily preference.
       for (const id of alertRecipients(s, event)) this.enqueue(`alert:${event.id}:${id}`, { userId: id, type: 'alert', scope: event,
-        method: 'sendMessage', body: { chat_id: id, text: event.text, link_preview_options: { is_disabled: true } } });
+        method: 'sendMessage', body: { chat_id: id, text: alertText(s, id, event), link_preview_options: { is_disabled: true } } });
       this.persist(); return;
     }
     if (!validUsername(event.username) || !/^\d+$/.test(event.target || '')) throw Error('TELEGRAM_EVENT_TARGET_INVALID');
@@ -108,6 +108,8 @@ export class PersonalDelivery {
         const url = catalog?.assets?.[task.catalogKey]?.mediaUrl;
         if (url && validMediaUrl(url)) task.body[task.method === 'sendVideo' ? 'video' : 'photo'] = url;
       }
+      // Re-render persisted alerts so pre-upgrade retries cannot expose details.
+      if (task.type === 'alert') task.body.text = alertText(this.settings(), task.userId, task.scope);
       count++;
       try { await client.call(task.method, task.body); }
       catch (error) {
