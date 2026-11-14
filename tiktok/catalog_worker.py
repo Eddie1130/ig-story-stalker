@@ -824,10 +824,64 @@ class Catalog:
             self.folder / "health.json", {**self.health_snapshot, "at": self.clock()}
         )
 
+    def manual_requests(self, settings):
+        import re
+        from urllib.parse import urlparse, urljoin
+        import requests
+
+        self.db.execute("CREATE TABLE IF NOT EXISTS manual_jobs(id TEXT PRIMARY KEY, attempts INTEGER, done INTEGER)")
+        for rid, request in settings.get("tiktokRequests", {}).items():
+            uid = request.get("userId")
+            if uid not in settings["allowedIds"] or not re.fullmatch(r"[1-9]\d{0,19}-\d+-\d+", rid) or not rid.startswith(uid + "-"):
+                continue
+            row = self.db.execute("SELECT attempts,done FROM manual_jobs WHERE id=?", (rid,)).fetchone()
+            attempts, done = row or (0, 0)
+            if done:
+                continue
+            event = {"username": "manual", "kind": "notice", "at": request["at"], "text": "TikTok 連結下載失敗，請稍後重新傳送。", "files": [], "recipients": [{"userId": uid, "generation": rid}], "requestId": rid, "requestUrl": request["url"]}
+            try:
+                url = request["url"]
+                for _ in range(6):
+                    parsed = urlparse(url)
+                    if parsed.scheme != "https" or parsed.hostname not in ("tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com") or parsed.username or parsed.password or parsed.port:
+                        raise ValueError("TIKTOK_INVALID_LINK")
+                    match = re.fullmatch(r"/@([A-Za-z0-9_][A-Za-z0-9_.]{0,23})/(?:video|photo)/(\d{1,30})/?", parsed.path)
+                    if match:
+                        break
+                    if not re.fullmatch(r"/(?:t/)?[A-Za-z0-9]+/?", parsed.path):
+                        raise ValueError("TIKTOK_INVALID_LINK")
+                    response = requests.get(url, allow_redirects=False, timeout=20)
+                    try:
+                        if response.status_code not in (301, 302, 303, 307, 308):
+                            raise ValueError("TIKTOK_SHORT_LINK_FAILED")
+                        url = urljoin(url, response.headers["Location"])
+                    finally:
+                        response.close()
+                else:
+                    raise ValueError("TIKTOK_REDIRECT_LIMIT")
+                name, iid = match.groups()
+                name = name.lower()
+                item = self.fetcher(name, "post", item_id=iid)["items"][0]
+                if item["id"] != iid:
+                    raise ValueError("TIKTOK_ITEM_IDENTITY_INVALID")
+                record = {"item": item, "folder": name, "kind": "post", "target": item["authorId"], "at": request["at"]}
+                event.update(username=name, kind="post", files=self.archive(record), text=f"TikTok @{name}\n{item.get('caption', '')}\n{url}", mediaCaption=f"@{name}\n{url}\n{item.get('caption', '')}"[:900])
+                done = 1
+            except Exception:
+                attempts += 1
+                done = int(attempts >= 3)
+            if done:
+                key = hashlib.sha256(("manual:" + rid).encode()).hexdigest()
+                self.db.execute("INSERT OR IGNORE INTO outbox VALUES(?,?)", (key, json.dumps(event)))
+            self.db.execute("INSERT OR REPLACE INTO manual_jobs VALUES(?,?,?)", (rid, attempts, done))
+            self.db.commit()
+            break
+
     def tick(self):
         settings = self.read_settings()
         self.active_names = set(subscriptions(settings))
         if os.getenv("IG_TELEGRAM_CONTROL", "1") == "1":
+            self.manual_requests(settings)
             for name in subscriptions(settings):
                 for kind in KINDS:
                     if STOP.is_set():

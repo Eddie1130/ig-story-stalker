@@ -18,13 +18,15 @@ function photoDimensions(file) {
   } finally { fs.closeSync(fd); }
 }
 export function tikTokContentPlan(event, root) {
-  const actions = xTextChunks(event.text).map(text => ({ method: 'sendMessage', body: { text } }));
+  const caption = typeof event.mediaCaption === 'string' && event.files.length ? event.mediaCaption.slice(0, 900) : undefined;
+  const actions = xTextChunks(caption !== undefined ? '' : event.text).map(text => ({ method: 'sendMessage', body: { text } }));
   let group = [];
   const flush = () => {
     if (!group.length) return;
+    if (caption !== undefined) group[0].caption = caption;
     if (group.length === 1) {
       const item = group[0];
-      actions.push({ method: { photo: 'sendPhoto', video: 'sendVideo', document: 'sendDocument' }[item.type], body: { [item.type]: item.media, ...(item.type === 'video' ? { supports_streaming: true } : {}) } });
+      actions.push({ method: { photo: 'sendPhoto', video: 'sendVideo', document: 'sendDocument' }[item.type], body: { [item.type]: item.media, ...(item.caption !== undefined ? { caption: item.caption } : {}), ...(item.type === 'video' ? { supports_streaming: true } : {}) } });
     } else actions.push({ method: 'sendMediaGroup', body: { media: group } });
     group = [];
   };

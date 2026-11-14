@@ -1,3 +1,4 @@
+import { tikTokLinkPattern, parseTikTokLink } from './tiktok-links.mjs';
 import { tikTokCallback, tikTokMessage } from './tiktok-menu.mjs';
 import { instagramLinks } from './instagram-links.mjs';
 import { kinds, validUsername, userTarget, put } from './telegram-settings.mjs';
@@ -65,7 +66,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
       result = panel(`每日摘要已${user.daily ? '開啟，每天香港時間 20:00 發送。' : '關閉。'}\n異常與恢復通知仍會發送。`, [back]);
     } else if (action === 'download') {
       delete user.waiting;
-      result = panel('直接貼上 Instagram 貼文、Reel、Story 或精選連結即可下載。\n每則訊息最多 10 個連結；貼上帳號首頁會先詢問是否加入監看。', [back]);
+      result = panel('直接貼上 Instagram、X 或 TikTok 貼文連結即可下載。\n每則訊息最多 10 個連結；貼上帳號首頁會先詢問是否加入監看。', [back]);
     } else if (action === 'follow' && validUsername(name)) {
       if (!userTarget(user, name)) put(user.targets, name, subscription(now));
       result = accountMenu(user, name);
@@ -81,16 +82,32 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
   } else {
     const text = String(message.text || message.caption || '').trim();
     const linkedText = [text, ...(message.entities || message.caption_entities || []).filter(e => e.type === 'text_link' && typeof e.url === 'string').map(e => e.url)].join(' ');
-    const totalLinks = (linkedText.match(/(?:https?:\/\/[^\s<>"']+|(?:(?:www|mobile|m)\.)?(?:instagram|x|twitter|fxtwitter)\.com\/[^\s<>"']+)/gi) || []).length;
+    const totalLinks = (linkedText.match(/(?:https?:\/\/[^\s<>"']+|(?:(?:www|mobile|m|vm|vt)\.)?(?:instagram|x|twitter|fxtwitter|tiktok)\.com\/[^\s<>"']+)/gi) || []).length;
+    const ttLinks = totalLinks <= 10 ? (linkedText.match(tikTokLinkPattern) || []) : [];
+    let ttResult;
+    if (ttLinks.length) {
+      let count = 0;
+      for (const [i, raw] of ttLinks.entries()) {
+        try {
+          const url = parseTikTokLink(raw.replace(/[),\]，。！!]+$/, ''));
+          const requestId = `${id}-${update.update_id}-${i}`;
+          settings.tiktokRequests ||= {};
+          settings.tiktokRequests[requestId] = { id: requestId, userId: id, url, at: now };
+          count++;
+        } catch {}
+      }
+      ttResult = panel(`已加入 ${count} 個 TikTok 連結到下載佇列。${count < ttLinks.length ? '部分連結格式不支援。' : '完成後會回傳媒體。'}`, [back]);
+    }
     const xResult = totalLinks > 10 || /^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text) ? undefined : xMessage(settings, user, id, text, linkedText, update.update_id, now);
     if (totalLinks > 10) result = panel('每則訊息最多 10 個連結，請分批傳送。', [back]);
     else if (/^\/(start|menu|cancel)(?:@[A-Za-z0-9_]+)?$/.test(text)) { delete user.waiting; result = mainMenu(user); }
     else if (/^\/status$/.test(text)) result = panel(statusText(id), [[button('🔄 重新整理', 'status')], back]);
     else if (user.waiting === 'tt:add' || /^\/ttadd\s+/.test(text)) result = tikTokMessage(user, text, now);
+    else if (ttResult && !xResult && !hasInstagramLinks(linkedText)) result = ttResult;
     else if (xResult && !hasInstagramLinks(linkedText)) result = xResult;
     else if (/https?:\/\/|(?:^|\s)(?:www\.|m\.)?instagram\.com\//i.test(linkedText)) {
       try {
-        const links = instagramLinks(xResult ? linkedText.replace(xLinkPattern, '') : linkedText);
+        const links = instagramLinks((xResult ? linkedText.replace(xLinkPattern, '') : linkedText).replace(tikTokLinkPattern, ''));
         if (!links.length) throw Error('MANUAL_INVALID_LINK');
         const profiles = links.filter(link => link.kind === 'profile');
         const content = links.filter(link => !['profile','invalid'].includes(link.kind));
@@ -119,6 +136,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
         result = panel(`${existing ? '已在你的清單中' : '已加入監看'}：@${name}\n目前可取得的 Story 會依設定通知；舊貼文與精選只下載。\n若帳號不存在或無法存取，會顯示異常通知。`, [[button('設定通知', 'account:' + name)], back]);
       }
     } else result = mainMenu(user);
+    if (ttResult && result !== ttResult) result = combinePanels(result, ttResult);
     if (xResult && hasInstagramLinks(linkedText)) result = combinePanels(result, xResult);
   }
   settings.replies[`reply:${update.update_id}`] = { method: 'sendMessage', body: { chat_id: id, ...result }, userId: id, at: now };

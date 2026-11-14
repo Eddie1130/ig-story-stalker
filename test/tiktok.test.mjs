@@ -163,3 +163,14 @@ test('Story lane sends while a post video upload is still pending', async t => {
   const delivery=new TikTokDelivery({...f,settings:()=>s}),post=delivery.drain(client,{lane:'content'});
   await wait;await delivery.drain(client,{lane:'story'});assert.ok(seen.includes('new Story'));release();await post;
 });
+test('manual TikTok downloads enqueue without subscriptions and enforce ten links', t => {
+  const { settings: s, ...f } = fixture(t);
+  applyUpdate(s, msg(1, 100, 'https://www.tiktok.com/@alice/video/123'));
+  assert.equal(s.tiktokRequests['100-1-0'].url, 'https://www.tiktok.com/@alice/video/123');
+  const delivery = new TikTokDelivery({ ...f, settings: () => s });
+  const event = { requestId: '100-1-0', requestUrl: s.tiktokRequests['100-1-0'].url };
+  assert.equal(delivery.eligible(event, { userId: '100' }), true);
+  assert.equal(delivery.eligible(event, { userId: '200' }), false);
+  applyUpdate(s, msg(2, 100, Array(11).fill('vt.tiktok.com/ABC/').join(' ')));
+  assert.equal(Object.keys(s.tiktokRequests).length, 1);
+});

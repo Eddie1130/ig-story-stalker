@@ -124,7 +124,7 @@ export async function run({ env = process.env, args = process.argv } = {}) {
     // Do not silently delete another deployment's webhook or pending updates.
     const webhook = await client.call('getWebhookInfo', {}, { polling: true });
     if (webhook?.url) throw Error('TELEGRAM_WEBHOOK_CONFIGURED');
-    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'ttadd', description: '新增 TikTok 帳號，例如 /ttadd alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
+    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'ttadd', description: '新增 TikTok 帳號，例如 /ttadd alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram、X 或 TikTok 連結下載原檔' }] });
     await client.call('setChatMenuButton', { menu_button: { type: 'commands' } });
     health(); log('TELEGRAM_CONTROL_STARTED');
     async function poll() {

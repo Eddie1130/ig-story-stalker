@@ -520,3 +520,5 @@ Check `NOVNC_BIND_ADDRESS`, `NOVNC_PORT`, host firewall rules, and the files und
 ## Project status
 
 This project is an experimental personal automation tool. Expect maintenance when Instagram changes its private web APIs. There is currently no license; public visibility does not grant permission to copy, modify, or redistribute the code.
+
+Telegram 手動下載：直接傳送 TikTok `/@帳號/video/ID`、`/@帳號/photo/ID` 或 `vm.tiktok.com`／`vt.tiktok.com`／`tiktok.com/t/` 分享連結，即可排隊下載並回傳媒體。需要啟動 `tiktok-catalog` 及 Telegram 服務；不需要訂閱該帳號。下載失敗會自動重試，三次失敗後通知申請者。
