@@ -431,12 +431,17 @@ test('shared incidents reveal details only to owner, including persisted retries
     for (const task of Object.values(f.delivery.state.pending)) task.body.text = event.text;
     f.delivery.persist();
     const restarted = new PersonalDelivery({ dir: f.control, stateDir: f.state, settings: () => f.settings });
-    await restarted.drain({ call: async (_, body) => sent.push(structuredClone(body)) });
+    await restarted.drain({ call: async (method, body) => { sent.push({ method, ...structuredClone(body) }); return { message_id: Number(body.chat_id) }; } });
     const pair = sent.slice(-2);
-    assert.equal(pair.find(body => body.chat_id === '100').text, event.text);
-    const publicText = pair.find(body => body.chat_id === '200').text;
-    assert.doesNotMatch(publicText, /NAS_ENOSPC|private|alice/);
-    assert.match(publicText, kind === 'recovery' ? /服務已恢復/ : /稍後再試/);
+    if (kind === 'error') {
+      assert.equal(pair.find(body => body.chat_id === '100').text, event.text);
+      const publicText = pair.find(body => body.chat_id === '200').text;
+      assert.doesNotMatch(publicText, /NAS_ENOSPC|private|alice/);
+      assert.match(publicText, /稍後再試/);
+    } else {
+      assert.ok(pair.every(body => body.method === 'deleteMessage'));
+      assert.deepEqual(pair.map(body => body.message_id), [100, 200]);
+    }
     f.delivery = restarted;
   }
   f.delivery.ingest({ version: 1, type: 'alert', id: 'account', kind: 'error', at: 3000, username: 'alice', issueKey: 'target:alice:fetch', reason: 'FETCH_TIMEOUT', text: 'account detail' });

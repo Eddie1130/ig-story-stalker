@@ -39,9 +39,14 @@ export class TelegramClient {
       data = await response.json();
     } catch { throw Error('TELEGRAM_NETWORK_OR_RESPONSE_ERROR'); }
     if (!response.ok || data.ok !== true) {
+      // Telegram returns 400 for a successful no-op edit. Treat only this exact case as acknowledged.
+      if (method === 'editMessageText' && data.error_code === 400 && /^Bad Request: message is not modified/.test(data.description || '')) return true;
       const retry = Number(data.parameters?.retry_after);
       if (Number.isFinite(retry) && retry > 0) { this.rate.retryAt = Date.now() + retry * 1000; atomic(this.file, this.rate); }
-      throw Error(`TELEGRAM_ERROR_${Number.isInteger(data.error_code) ? data.error_code : response.status}`);
+      const error = Error(`TELEGRAM_ERROR_${Number.isInteger(data.error_code) ? data.error_code : response.status}`);
+      if (data.error_code === 400 && /message to edit not found|message can't be edited/.test(data.description || '')) error.messageUnavailable = true;
+      if (method === 'deleteMessage' && data.error_code === 400 && /message to delete not found/.test(data.description || '')) return true;
+      throw error;
     }
     return data.result;
   }

@@ -73,9 +73,11 @@ def status(name, phase):
         STATUS[name] = {'phase': phase}
 
 
-def emit(name, kind, text, recipients, files=None, at=None, identity=None):
+def emit(name, kind, text, recipients, files=None, at=None, identity=None, notice_key=None, notice_kind=None):
     event = {'username': name, 'kind': kind, 'text': text, 'recipients': recipients,
              'files': files or [], 'at': at or int(time.time() * 1000)}
+    if notice_key:
+        event.update(noticeKey=notice_key, noticeKind=notice_kind)
     key = hashlib.sha256((identity or json.dumps(event, sort_keys=True)).encode()).hexdigest()
     atomic(STATE / 'events' / (key + '.json'), event)
 
@@ -136,6 +138,10 @@ def processing():
         try:
             job = json.loads(file.read_text())
             finalize(job)
+            if job.get('alerted'):
+                emit(job['username'], 'notice', '', job['recipients'],
+                     identity='processing-recovery:' + file.name,
+                     notice_key='processing:' + hashlib.sha256(file.name.encode()).hexdigest(), notice_kind='recovery')
             file.unlink()
         except Exception as error:
             if job:
@@ -143,7 +149,7 @@ def processing():
                     job['failures'] = job.get('failures', 0) + 1
                     status(job['username'], '轉檔／分段失敗，已保留待重試' if job['failures'] >= 3 or needs_attention(error) else f"轉檔重試中（{job['failures']}/3）")
                     if not job.get('alerted') and (job['failures'] >= 3 or needs_attention(error)):
-                        emit(job['username'], 'notice', 'TikTok 轉檔／分段失敗，原檔已保留；稍後重試。', job['recipients'], identity='processing-error:' + file.name)
+                        emit(job['username'], 'notice', 'TikTok 轉檔／分段失敗，原檔已保留；稍後重試。', job['recipients'], identity='processing-error:' + file.name, notice_key='processing:' + hashlib.sha256(file.name.encode()).hexdigest(), notice_kind='error')
                         job['alerted'] = True
                     atomic(file, job)
                 except Exception:
@@ -179,6 +185,8 @@ def record_account(name, cookie_map):
                     emit(name, 'start', f'🔴 TikTok @{name} 已開播，開始錄影。', self.recipients, at=self.started)
                     self.announced = True
                     status(name, '錄影中')
+                    emit(name, 'notice', '', self.recipients,
+                         notice_key=f'recording:{name}', notice_kind='recovery')
                 yield chunk
 
         def _tiktok_alert(self, kind, reason, stage=None):
@@ -187,14 +195,14 @@ def record_account(name, cookie_map):
             if previous and now - previous < 600:
                 return
             self._last_integration_alert = now
-            emit(name, 'notice', f'TikTok @{name} 錄影異常／中斷（{kind}）；本機已保留取得的資料。', self.recipients)
+            emit(name, 'notice', f'TikTok @{name} 錄影異常／中斷（{kind}）；本機已保留取得的資料。', self.recipients, notice_key=f'recording:{name}', notice_kind='error')
 
         def finalize(self, source):
             job = {'source': source, 'dest': str(Path(source).parent / (self.stem + '.mp4')), 'username': name, 'recipients': self.recipients, 'at': self.started}
             file = STATE / 'processing' / (self.stem + '_' + name + '.json')
             atomic(file, job)
             if STOP.is_set():
-                emit(name, 'notice', f'TikTok @{name} 錄影因服務停止而中斷，已保留原檔及轉檔工作。', self.recipients)
+                emit(name, 'notice', f'TikTok @{name} 錄影因服務停止而中斷，已保留原檔及轉檔工作。', self.recipients, notice_key=f'recording:{name}', notice_kind='error')
             PROCESSING.put(file)
             (STATE / 'captures' / (name + '.json')).unlink(missing_ok=True)
 
@@ -227,14 +235,14 @@ def record_account(name, cookie_map):
                 rec._recording_phase = 'starting'
                 rec.start_recording(name, room)
             if alerted:
-                emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients)
+                emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients, notice_key=f'live-monitor:{name}', notice_kind='recovery')
                 alerted = False
             failures = 0
             status(name, '監看中')
         except (UserLiveError, LiveNotFound) as error:
             if str(TikTokError.USER_NOT_CURRENTLY_LIVE) in str(error):
                 if alerted:
-                    emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients)
+                    emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients, notice_key=f'live-monitor:{name}', notice_kind='recovery')
                     alerted = False
                 failures = 0
                 status(name, '未開播')
@@ -248,7 +256,7 @@ def record_account(name, cookie_map):
             abnormal = alerted or failures >= 3 or urgent
             status(name, '檢查／錄影異常，重試中' if abnormal else f'等待重試（{failures}/3）')
             if abnormal and not alerted:
-                emit(name, 'notice', f'TikTok @{name} 監控／錄影失敗，將持續重試。', recipients)
+                emit(name, 'notice', f'TikTok @{name} 監控／錄影失敗，將持續重試。', recipients, notice_key=f'live-monitor:{name}', notice_kind='error')
                 alerted = True
         STOP.wait(60)
     status(name, '已停止監控')
@@ -267,7 +275,7 @@ def main():
         if source.exists() and source.stat().st_size >= 4096:
             file = STATE / 'processing' / capture.name
             atomic(file, job)
-            emit(job['username'], 'notice', 'TikTok 錄影曾因服務停止而中斷；正在處理保留的原檔。', job['recipients'])
+            emit(job['username'], 'notice', 'TikTok 錄影曾因服務停止而中斷；正在處理保留的原檔。', job['recipients'], notice_key=f"recording:{job['username']}", notice_kind='error')
         capture.unlink()
     for file in (STATE / 'processing').glob('*.json'):
         PROCESSING.put(file)

@@ -109,3 +109,26 @@ test('profile pagination accepts confirmed coauthors but rejects invitations and
  const tray={data:{highlights:{edges:[{node:{id:'highlight:77',title:'x',user:{pk:'123'},coauthor_producers:[{id:'99'}]}}],page_info:{has_next_page:false,has_previous_page:false}}}};
  assert.throws(()=>normalizeResponse(tray,{kind:'tray'},'99'),/OWNER_MISMATCH/);
 });
+
+test('post catalog can ignore only the known unused location image field exception', () => {
+ const response = body();
+ const locationError = {message:'A server error field_exception occured. Check server logs for details.',severity:'ERROR',path:['xdt_api__v1__feed__user_timeline_graphql_connection','edges',0,'node','location','profile_pic_url']};
+ response.errors = [locationError];
+ const raw = value => ({status:200,text:JSON.stringify(value)});
+ const options = {allowPostLocationImageError:true};
+ assert.throws(()=>decodeResponse(raw(response)),/SERVER_OR_GRAPHQL_ERROR/,'manual and default callers stay strict');
+ const decoded = decodeResponse(raw(response), options);
+ assert.equal(normalizeResponse(decoded,{kind:'posts',cursor:null},'99').posts.length,1);
+ for (const error of [
+   {...locationError,path:['xdt_viewer','profile_pic_url']},
+   {...locationError,path:['xdt_api__v1__feed__user_timeline_graphql_connection','edges',0,'node','user','profile_pic_url']},
+   {...locationError,path:['xdt_api__v1__feed__user_timeline_graphql_connection','edges',0,'node','video_versions']},
+   {...locationError,path:['xdt_api__v1__feed__user_timeline_graphql_connection','edges',9,'node','location','profile_pic_url']},
+   {...locationError,message:'Permission denied'},
+ ]) assert.throws(()=>decodeResponse(raw({...response,errors:[error]}),options),/SERVER_OR_GRAPHQL_ERROR/);
+ assert.throws(()=>decodeResponse(raw({...response,errors:[locationError,{message:'Rate limited'}]}),options),/SERVER_OR_GRAPHQL_ERROR/);
+ assert.throws(()=>decodeResponse(raw({...response,status:'fail'}),options),/SERVER_OR_GRAPHQL_ERROR/);
+ assert.throws(()=>decodeResponse(raw({...response,error:123}),options),/SERVER_OR_GRAPHQL_ERROR/);
+ const invalid = structuredClone(response); delete invalid.data.xdt_api__v1__feed__user_timeline_graphql_connection.edges[0].node.carousel_media[0].image_versions2;
+ assert.throws(()=>normalizeResponse(decodeResponse(raw(invalid),options),{kind:'posts',cursor:null},'99'),/IMAGE_VARIANT_MISSING/);
+});

@@ -121,17 +121,21 @@ alerts can also migrate and recover under the correct account identity.
 
 ## Telegram private menus
 
-Send `/start` or `/menu` to your bot in a **private chat**. The command menu offers:
+Send `/start` or `/menu` to your bot in a **private chat**. The home menu has
+Instagram, X / Twitter, TikTok, notifications and status. Each platform opens your
+account list directly, with status, supported features, account buttons and Add.
+Account pages retain individual notification settings, removal and archive export.
 
-- **監看帳號** / **新增帳號**: add a username such as `alice` or `@alice`, or confirm
-  removing a subscription. `/add alice` is also supported.
-- **媒體通知**: select an account and independently enable/disable Story, post and
-  Highlight notifications. All three are enabled by default; local downloads continue.
-- **每日摘要**: disabled by default. When enabled, receive one personal summary per
-  Hong Kong calendar day at 20:00. If the service starts after that time, today's
-  summary is queued then. Account errors and recovery alerts remain enabled.
-- **我的狀態** / `/status`: view only your subscriptions and relevant incidents.
-  `/cancel` exits an account-entry prompt.
+The notifications page has a personal media master switch and a separate daily
+summary switch (disabled by default; Hong Kong time 20:00). Local downloads continue
+while notifications are off. Re-enabling preserves account preferences and does not
+backfill disabled-period media. Incidents still notify; recovery removes their saved
+notification messages instead of sending a recovery message. Pre-upgrade messages
+without saved Telegram IDs cannot be removed automatically.
+
+Navigation, refresh, settings and account-entry replies edit the existing bot message.
+A deleted or uneditable menu gets a replacement. `/status` shows your subscriptions
+and relevant incidents; `/cancel` exits an account-entry prompt.
 
 The owner is `TELEGRAM_OWNER_USER_ID`, or the positive private-user
 `TELEGRAM_CHAT_ID` when the owner variable is omitted. If the old destination is a
@@ -197,7 +201,7 @@ it out of Git/support attachments. Account archives retain their existing locati
 ## Download an Instagram link
 
 In the bot's private chat, paste a post, Reel, Story, Highlight or Instagram share
-link. `/download <link>` and the **連結下載** menu entry are also available. Each
+link directly; there is no download menu entry. `/download <link>` remains compatible. Each
 message accepts up to ten links; each link is an independent durable job. Invalid
 or unavailable links are reported without discarding other valid jobs. This uses
 the existing approved-user list and saved Instagram login. Content must be

@@ -1,3 +1,4 @@
+import { platformMenu } from './platform-menu.mjs';
 import { tikTokName, tikTokKinds, tikTokSubscription, tikTokLabels } from './tiktok-settings.mjs';
 const b = (text, callback_data) => ({ text, callback_data });
 const panel = (text, rows = []) => ({ text, reply_markup: { inline_keyboard: [...rows, [b('⬅️ TikTok', 'tt:menu'), b('主選單', 'menu')]] } });
@@ -12,15 +13,12 @@ function account(user, name) {
     [b('移除訂閱', `tt:remove:${name}:${gen}`)],
   ]);
 }
-export function tikTokCallback(user, data, now) {
+export function tikTokCallback(user, data, now, overview) {
   const [, action, name, kind, value, gen] = data.split(':');
   user.tiktokTargets ||= {};
   if (action === 'menu' || action === 'list') {
     delete user.waiting;
-    const names = Object.keys(user.tiktokTargets).sort();
-    const page = action === 'list' && /^\d{1,5}$/.test(name || '') ? Math.min(Number(name), Math.max(0, Math.ceil(names.length / 8) - 1)) : 0;
-    return panel('🎬 TikTok 帳號訂閱', [...names.slice(page * 8, page * 8 + 8).map(n => [b('@' + n, 'tt:account:' + n)]),
-      ...(page ? [[b('上一頁', `tt:list:${page - 1}`)]] : []), ...(names.length > (page + 1) * 8 ? [[b('下一頁', `tt:list:${page + 1}`)]] : []), [b('新增帳號', 'tt:add')]]);
+    return platformMenu(user, 'tt', action === 'list' && /^\d{1,5}$/.test(name || '') ? Number(name) : 0, overview);
   }
   if (action === 'add') { user.waiting = 'tt:add'; return panel('請輸入 TikTok 帳號，例如 @alice。輸入 /cancel 取消。'); }
   const sub = subFor(user, name);
@@ -32,7 +30,7 @@ export function tikTokCallback(user, data, now) {
   }
   if (['remove', 'delete'].includes(action) && sub.generation.slice(0, 8) === kind) {
     if (action === 'remove') return panel(`移除 @${name}？正在錄製的直播會完成後再停止；保留本機檔案。`, [[b('確認移除', `tt:delete:${name}:${kind}`)]]);
-    delete user.tiktokTargets[name]; return panel('已移除訂閱；其他人的訂閱不受影響。');
+    delete user.tiktokTargets[name]; return platformMenu(user, 'tt', 0, overview);
   }
   return panel('選單已過期。');
 }

@@ -1,3 +1,4 @@
+import { platformMenu } from './platform-menu.mjs';
 import { validXUsername, xKinds, xLinks } from './x-model.mjs';
 import { xSubscription, xTarget, putXTarget, validXDate } from './x-settings.mjs';
 
@@ -8,13 +9,7 @@ const back = [button('⬅️ X 選單', 'x:menu')];
 export const xLinkPattern = /(?:https?:\/\/)?(?:(?:www|mobile|m)\.)?(?:x|twitter|fxtwitter)\.com\/[^\s<>"']+/gi;
 export const hasInstagramLinks = text => /(?:https?:\/\/)?(?:www\.|m\.)?instagram\.com\//i.test(text);
 
-export function xMainMenu(user) {
-  return panel('X 監看設定\n第一次輪詢只封存並建立基準，之後的新內容才通知。\n通知關閉時仍持續封存。', [
-    [button('👥 X 監看帳號', 'x:list:0'), button('➕ 新增 X 帳號', 'x:add')],
-    [button('🔗 X 連結下載', 'x:download'), button('📊 我的狀態', 'status')],
-    [button('📷 Instagram', 'ig:menu'), button('⬅️ 平台選單', 'menu')],
-  ]);
-}
+export function xMainMenu(user, overview) { return platformMenu(user, 'x', 0, overview); }
 function xAccountMenu(user, name) {
   const sub = xTarget(user, name);
   if (!sub) return panel('此 X 帳號已不在你的清單中。', [back]);
@@ -28,13 +23,7 @@ function xAccountMenu(user, name) {
     [button('⬅️ X 帳號清單', 'x:list:0')], back,
   ]);
 }
-function xListMenu(user, page = 0) {
-  const names = Object.keys(user.xTargets || {}).sort(), last = Math.max(0, Math.ceil(names.length / 8) - 1);
-  page = Math.min(Math.max(0, page), last);
-  const rows = names.slice(page * 8, page * 8 + 8).map(name => [button('@' + name, 'x:account:' + name)]);
-  if (last) rows.push([...(page ? [button('上一頁', 'x:list:' + (page - 1))] : []), ...(page < last ? [button('下一頁', 'x:list:' + (page + 1))] : [])]);
-  return panel(names.length ? `你的 X 監看帳號（${page + 1}/${last + 1}）` : '尚未加入 X 帳號。', [...rows, [button('➕ 新增 X 帳號', 'x:add')], back]);
-}
+function xListMenu(user, page = 0, overview) { return platformMenu(user, 'x', page, overview); }
 function addTarget(user, raw, now) {
   const name = raw.trim().replace(/^@/, '').toLowerCase();
   if (!validXUsername(name)) return panel('X 使用者名稱格式不正確，請只輸入 1–15 個英文字母、數字或底線。', [back]);
@@ -55,11 +44,11 @@ function history(settings, user, id, updateId, name, now, start, end) {
   delete user.waiting;
   return panel(`已申請 @${name} 的歷史回補。\n${start ? `${start} 至 ${end}（不含結束當天）` : '自動從帳號建立日抓到啟動當天。'}\n同一目標共用任務，其他回補會排隊；只通知進度與結果。\n可按「我的狀態」查看進度。`, [back]);
 }
-export function xCallback(settings, user, id, data, updateId, now) {
+export function xCallback(settings, user, id, data, updateId, now, overview) {
   const [prefix, action, name, kind, value, generation] = String(data).split(':');
   if (prefix !== 'x') return;
-  if (action === 'menu') { delete user.waiting; return xMainMenu(user); }
-  if (action === 'list' && /^\d{1,5}$/.test(name)) return xListMenu(user, Number(name));
+  if (action === 'menu') { delete user.waiting; return xMainMenu(user, overview); }
+  if (action === 'list' && /^\d{1,5}$/.test(name)) return xListMenu(user, Number(name), overview);
   if (action === 'add') { user.waiting = 'x:add'; return panel('請傳送 X 使用者名稱，例如 alice 或 @alice。\n輸入 /cancel 可取消。', [back]); }
   if (action === 'download') { delete user.waiting; return panel('貼上 x.com、twitter.com 或 fxtwitter.com 的單篇貼文連結，即可下載文字與媒體。\n貼上帳號首頁會先詢問是否訂閱。', [back]); }
   if (action === 'follow' && validXUsername(name)) return addTarget(user, name, now);
@@ -74,7 +63,7 @@ export function xCallback(settings, user, id, data, updateId, now) {
     if (action === 'history') return history(settings, user, id, updateId, name, now);
     if (action === 'dates') return panel(`請傳送：\n/xhistory ${name} YYYY-MM-DD YYYY-MM-DD\n例如 /xhistory ${name} 2024-01-01 2025-01-01\n結束日期不包含當天。`, [back]);
     if (action === 'remove') return panel(`要移除 X @${name} 嗎？\n保留本機檔案及歷史；其他使用者的訂閱不受影響。`, [[button('確認移除', `x:delete:${name}:${kind}`)], [button('取消', 'x:account:' + name)]]);
-    delete user.xTargets[name]; return xListMenu(user);
+    delete user.xTargets[name]; return xListMenu(user, 0, overview);
   }
   return panel('此 X 選單已過期，請重新選擇。', [back]);
 }

@@ -100,7 +100,10 @@ class TikTokWorkerTests(unittest.TestCase):
                 patch.object(w, 'STOP', Mock(is_set=Mock(return_value=False))), \
                 patch.object(w, 'finalize', side_effect=fail), patch.object(w, 'emit') as emit:
             w.processing()
-        self.assertEqual(emit.call_count, 1)
+        self.assertEqual(emit.call_count, 2)
+        self.assertEqual(emit.call_args_list[0].kwargs['notice_kind'], 'error')
+        self.assertEqual(emit.call_args_list[1].kwargs['notice_kind'], 'recovery')
+        self.assertEqual(emit.call_args_list[0].kwargs['notice_key'], emit.call_args_list[1].kwargs['notice_key'])
         self.assertFalse(file.exists())
 
     def run_live_monitor(self, outcomes):

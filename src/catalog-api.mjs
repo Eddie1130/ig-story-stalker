@@ -38,12 +38,24 @@ export function makeRequest(plan, config) {
   }
   throw Error('CATALOG_INVALID_PLAN');
 }
-export function decodeResponse(result) {
+function optionalLocationImageError(body, error) {
+  const path = error?.path;
+  if (error?.message !== 'A server error field_exception occured. Check server logs for details.' || error.severity !== 'ERROR' ||
+      !Array.isArray(path) || path.length !== 6 || path[0] !== 'xdt_api__v1__feed__user_timeline_graphql_connection' ||
+      path[1] !== 'edges' || !Number.isSafeInteger(path[2]) || path[2] < 0 || path[3] !== 'node' ||
+      path[4] !== 'location' || path[5] !== 'profile_pic_url') return false;
+  const edges = body.data?.xdt_api__v1__feed__user_timeline_graphql_connection?.edges;
+  return Array.isArray(edges) && !!edges[path[2]]?.node;
+}
+export function decodeResponse(result, { allowPostLocationImageError = false } = {}) {
   if (result.status !== 200) throw Error(`CATALOG_HTTP_${result.status}`);
   let body;
   try {body=JSON.parse(result.text.replace(/^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*/,''));}
   catch {throw Error('CATALOG_NON_JSON_RESPONSE');}
-  if (!body || typeof body !== 'object' || body.error || body.errors?.length || body.status === 'fail') throw Error('CATALOG_SERVER_OR_GRAPHQL_ERROR');
+  if (!body || typeof body !== 'object' || body.error || body.status === 'fail') throw Error('CATALOG_SERVER_OR_GRAPHQL_ERROR');
+  // Location avatars are not archived. All required post/media fields still pass normalizeResponse's strict checks.
+  if (body.errors !== undefined && (!Array.isArray(body.errors) ||
+      body.errors.some(error => !allowPostLocationImageError || !optionalLocationImageError(body, error)))) throw Error('CATALOG_SERVER_OR_GRAPHQL_ERROR');
   return body;
 }
 function media(item, fallbackTime) {

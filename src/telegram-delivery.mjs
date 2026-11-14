@@ -1,7 +1,8 @@
+import { updateNotice, validateNotices } from './telegram-notices.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomic, load } from './error-monitor.mjs';
-import { userTarget, subscribed, alertRecipients, alertText, validUsername, kinds } from './telegram-settings.mjs';
+import { userTarget, subscribed, alertRecipients, alertText, validUsername, kinds, mediaEnabled } from './telegram-settings.mjs';
 import { mediaRequest, validMediaUrl } from './story-media.mjs';
 
 const object = v => v && typeof v === 'object' && !Array.isArray(v);
@@ -11,6 +12,7 @@ export class PersonalDelivery {
     this.file = path.join(dir, 'delivery.json');
     if (fs.existsSync(this.file + '.required') && !fs.existsSync(this.file)) throw Error('TELEGRAM_DELIVERY_HISTORY_MISSING');
     this.state = load(this.file, { version: 1, pending: {}, seen: {}, firstSeen: {}, initialized: {}, summaries: {}, legacyImported: false });
+    validateNotices(this.state);
     const s = this.state;
     if (s.version !== 1 || ![s.pending, s.seen, s.firstSeen, s.initialized, s.summaries].every(object) || typeof s.legacyImported !== 'boolean') throw Error('TELEGRAM_DELIVERY_HISTORY_INVALID');
     if (!s.legacyImported) {
@@ -41,7 +43,9 @@ export class PersonalDelivery {
     if (event.type === 'alert') {
       if (typeof event.text !== 'string' || event.text.length > 3500 || typeof event.id !== 'string') throw Error('TELEGRAM_ALERT_INVALID');
       if (event.kind === 'status') return; // Superseded by each user's daily preference.
-      for (const id of alertRecipients(s, event)) this.enqueue(`alert:${event.id}:${id}`, { userId: id, type: 'alert', scope: event,
+      const recipients = new Set(alertRecipients(s, event));
+      if (event.kind === 'recovery') for (const id of s.allowedIds) if (this.state.notices?.[JSON.stringify([id, event.issueKey])]) recipients.add(id);
+      for (const id of recipients) this.enqueue(`alert:${event.id}:${id}`, { userId: id, type: 'alert', scope: event,
         method: 'sendMessage', body: { chat_id: id, text: alertText(s, id, event), link_preview_options: { is_disabled: true } } });
       this.persist(); return;
     }
@@ -57,7 +61,7 @@ export class PersonalDelivery {
       }
       for (const id of s.allowedIds) for (const name of new Set(names)) {
         const sub = subscribed(s, id, name);
-        if (!sub || event.at < sub.joinedAt) continue;
+        if (!sub || !mediaEnabled(s.users[id], event.at) || event.at < sub.joinedAt) continue;
         const initKey = `${id}:${sub.generation}:${name}`;
         const initial = !this.state.initialized[initKey];
         const pref = sub.notifications.story;
@@ -77,7 +81,7 @@ export class PersonalDelivery {
           !validMediaUrl(event.body?.photo || event.body?.video) || typeof event.body?.caption !== 'string' || !Number.isFinite(event.publishedAt)) throw Error('TELEGRAM_EVENT_MEDIA_INVALID');
       for (const id of s.allowedIds) for (const name of new Set(names)) {
         const sub = subscribed(s, id, name), pref = sub?.notifications[event.kind];
-        if (!sub || !pref.enabled || event.at < Math.max(sub.joinedAt, pref.since) || event.publishedAt < sub.joinedAt) continue;
+        if (!sub || !mediaEnabled(s.users[id], event.at) || !pref.enabled || event.at < Math.max(sub.joinedAt, pref.since) || event.publishedAt < sub.joinedAt) continue;
         const key = this.key(id, sub, name, event.kind, event.id);
         this.enqueue(key, { userId: id, type: 'media', username: name, generation: sub.generation, kind: event.kind,
           eligibilityAt: event.at, target: event.target, catalogKey: event.id,
@@ -89,10 +93,10 @@ export class PersonalDelivery {
   eligible(task) {
     const s = this.settings();
     if (!s.allowedIds.includes(task.userId)) return false;
-    if (task.type === 'alert') return alertRecipients(s, task.scope).includes(task.userId);
+    if (task.type === 'alert') return task.scope.kind === 'recovery' || alertRecipients(s, task.scope).includes(task.userId);
     if (task.type === 'summary') return s.users[task.userId]?.daily === true && task.day === localDay(Date.now());
     const sub = subscribed(s, task.userId, task.username);
-    return sub?.generation === task.generation && sub.notifications[task.kind]?.enabled && task.eligibilityAt >= sub.notifications[task.kind].since;
+    return mediaEnabled(s.users[task.userId], task.eligibilityAt) && sub?.generation === task.generation && sub.notifications[task.kind]?.enabled && task.eligibilityAt >= sub.notifications[task.kind].since;
   }
   async drain(client, { limit = 20, stopping = () => false } = {}) {
     let count = 0, ok = true;
@@ -111,7 +115,13 @@ export class PersonalDelivery {
       // Re-render persisted alerts so pre-upgrade retries cannot expose details.
       if (task.type === 'alert') task.body.text = alertText(this.settings(), task.userId, task.scope);
       count++;
-      try { await client.call(task.method, task.body); }
+      try {
+        if (task.type === 'alert' && task.scope.issueKey) {
+          await updateNotice(client, this.state, JSON.stringify([task.userId, task.scope.issueKey]), {
+            at: task.scope.at, userId: task.userId, text: task.body.text, recovery: task.scope.kind === 'recovery',
+          }, () => this.persist());
+        } else if (task.type !== 'alert' || task.scope.kind !== 'recovery') await client.call(task.method, task.body);
+      }
       catch (error) {
         task.failures++; task.retryAt = Date.now() + Math.min(300, 15 * 2 ** Math.min(task.failures, 5)) * 1000;
         task.error = /^TELEGRAM_[A-Z0-9_]+$/.test(error.message) ? error.message : 'TELEGRAM_SEND_FAILED';

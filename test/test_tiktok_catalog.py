@@ -25,6 +25,20 @@ from catalog_media import delivery_parts
 
 
 class CatalogTests(unittest.TestCase):
+    def test_pending_health_counts_are_available_per_account(self):
+        rows = [
+            ("123", "post", "1", json.dumps({"username": "alice", "status": "pending"})),
+            ("123", "post", "2", json.dumps({"username": "alice", "status": "pending"})),
+            ("456", "post", "3", json.dumps({"username": "bob", "status": "pending"})),
+        ]
+        self.catalog.db.executemany("INSERT INTO items VALUES(?,?,?,?)", rows)
+        self.catalog.db.commit()
+        self.catalog.health()
+        snapshot = self.catalog.health_snapshot
+        self.assertEqual(snapshot["pending"], 3)
+        self.assertEqual(snapshot["targets"]["alice"]["post"]["pending"], 2)
+        self.assertEqual(snapshot["targets"]["bob"]["post"]["pending"], 1)
+
     def test_archived_payloads_are_not_loaded_for_idle_work_or_health(self):
         record = {"username": "alice", "kind": "post", "status": "ready", "raw": "x" * 10000}
         self.catalog.db.executemany(

@@ -1,3 +1,5 @@
+import { updateNotice, noticeRecipients } from './telegram-notices.mjs';
+import { mediaEnabled } from './telegram-settings.mjs';
 import { tikTokContentKinds } from './tiktok-settings.mjs';
 import { tikTokContentPlan, contentBody } from './tiktok-content-files.mjs';
 import fs from 'node:fs';
@@ -16,11 +18,12 @@ export class TikTokDelivery extends XDelivery {
       const r = s.tiktokRequests?.[event.requestId];
       return s.allowedIds.includes(recipient.userId) && r?.userId === recipient.userId && event.requestUrl === r.url;
     }
+    if (event.kind === 'notice' && event.noticeKind === 'recovery' && s.allowedIds.includes(recipient.userId) && this.state.notices?.[JSON.stringify([recipient.userId, event.noticeKey])]) return true;
     const sub = Object.hasOwn(user?.tiktokTargets || {}, event.username) ? user.tiktokTargets[event.username] : null;
     if (!s.allowedIds.includes(recipient.userId) || sub?.generation !== recipient.generation) return false;
     if (event.kind === 'notice') return true;
     const preference = sub.notifications[event.kind];
-    return preference?.enabled && event.at >= sub.joinedAt && event.at >= preference.since;
+    return mediaEnabled(user, event.at) && preference?.enabled && event.at >= sub.joinedAt && event.at >= preference.since;
   }
   async drain(client, { stopping = () => false, lane = 'all' } = {}) {
     const dir = path.join(this.stateDir, 'tiktok/events');
@@ -35,11 +38,22 @@ export class TikTokDelivery extends XDelivery {
       if (!event || !tikTokName(event.username) || !['start','video','notice', ...tikTokContentKinds].includes(event.kind) || !Number.isFinite(event.at) || !Array.isArray(event.recipients) || event.recipients.some(r => !/^[1-9]\d{0,19}$/.test(r?.userId) || typeof r.generation !== 'string') || typeof event.text !== 'string' || event.text.length > 100000 || !Array.isArray(event.files) || event.files.some(f => typeof f !== 'string')) throw Error('TIKTOK_EVENT_INVALID');
       if (lane === 'video' && event.kind !== 'video' || lane === 'notice' && !['notice', 'start'].includes(event.kind) || lane === 'content' && (!tikTokContentKinds.includes(event.kind) || event.kind === 'story') || lane === 'story' && event.kind !== 'story') continue;
       if (++processed > 100) break;
+      event.recipients = noticeRecipients(this.state, event);
       for (const recipient of event.recipients) {
         const key = createHash('sha256').update(`${name}:${recipient.userId}:${recipient.generation}`).digest('hex');
         const entry = this.state.receipts[key] ||= { nextText: 0, nextGroup: 0, failures: 0 };
         if (entry.done || Date.now() < (entry.retryAt || 0)) continue;
         if (!this.eligible(event, recipient)) { entry.done = true; this.persist(); continue; }
+        if (event.kind === 'notice' && typeof event.noticeKey === 'string') {
+          try {
+            await updateNotice(client, this.state, JSON.stringify([recipient.userId, event.noticeKey]), { at: event.at, userId: recipient.userId, text: event.text, recovery: event.noticeKind === 'recovery' }, () => this.persist());
+            entry.done = true; delete entry.retryAt; this.persist();
+          } catch (error) {
+            if (!/^TELEGRAM_/.test(error.message)) throw error;
+            entry.failures++; entry.retryAt = Date.now() + 30000; this.persist(); ok = false;
+          }
+          continue;
+        }
         if (entry.uncertain) {
           const result = await this.send(client, entry, 'sendMessage', { chat_id: recipient.userId, text: `TikTok @${event.username} 傳送結果不確定，避免重複上傳；本機錄影保留。` }, [], 1, () => this.eligible(event, recipient));
           if (result === 'sent' || result === 'uncertain') { entry.done = true; this.persist(); }

@@ -498,3 +498,17 @@ test('backed-off live notifications do not block eligible live or history work',
   await f.watcher.archivePending(1000);
   assert.deepEqual(f.saves.map(e=>e.statusId),['3','2']);
 });
+
+test('manual history progress notices reuse one scope and are throttled', t => {
+  const f = fixture(t), job = f.watcher.enqueueHistory({ username: 'alice', userId: '100', requestId: '100-1-0' }, 1000);
+  job.status = 'working';
+  f.watcher.writeJob(job, 100000);
+  f.watcher.writeJob(job, 110000);
+  let progress = events(f).filter(e => e.noticeKind === 'progress');
+  assert.equal(progress.length, 1);
+  f.watcher.writeJob(job, 160001);
+  progress = events(f).filter(e => e.noticeKind === 'progress');
+  assert.equal(progress.length, 2);
+  assert.ok(progress.every(e => e.noticeKey === `history:${job.id}`));
+  assert.ok(progress.every(e => /預計完成：/.test(e.text)));
+});

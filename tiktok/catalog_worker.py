@@ -365,7 +365,7 @@ class Catalog:
         self.db.execute("INSERT INTO targets VALUES(?,?)", (uid, folder))
         return folder
 
-    def notice(self, name, text, recipients, identity):
+    def notice(self, name, text, recipients, identity, notice_key=None, notice_kind=None):
         event = {
             "username": name,
             "kind": "notice",
@@ -377,6 +377,8 @@ class Catalog:
                 for r in recipients
             ],
         }
+        if notice_key:
+            event.update(noticeKey=notice_key, noticeKind=notice_kind)
         key = hashlib.sha256(identity.encode()).hexdigest()
         self.db.execute(
             "INSERT OR IGNORE INTO outbox VALUES(?,?)", (key, json.dumps(event))
@@ -566,6 +568,7 @@ class Catalog:
                     f"TikTok @{name} {kind} 監控已恢復。",
                     recipients,
                     f"recovery:{name}:{kind}:{state['nextAt']}",
+                    notice_key=f"catalog:{name}:{kind}", notice_kind="recovery",
                 )
             # Full initial baseline walks every page quietly; later scans stop at known overlap.
             finished = not more or state["baseline"] and all_known
@@ -608,6 +611,7 @@ class Catalog:
                     f"TikTok @{name} {kind} 監控失敗：{state['reason']}，將持續重試。",
                     recipients,
                     f"error:{name}:{kind}:{now}",
+                    notice_key=f"catalog:{name}:{kind}", notice_kind="error",
                 )
                 state["alerted"] = True
                 self.save_stream(name, kind, state)
@@ -662,6 +666,7 @@ class Catalog:
                         f"TikTok @{record['username']} 有一筆待補查內容已恢復，將繼續下載。",
                         self.target_recipients(settings, record["username"]),
                         f"repaired:{target}:{kind}:{iid}:{record['at']}",
+                        notice_key=f"repair:{target}:{kind}:{iid}", notice_kind="recovery",
                     )
             except Exception as error:
                 record["failures"] += 1
@@ -681,6 +686,7 @@ class Catalog:
                         f"TikTok @{record['username']} 有一筆內容連續補查失敗，其餘內容會繼續封存。",
                         self.target_recipients(settings, record["username"]),
                         f"repair-error:{target}:{kind}:{iid}:{record['at']}",
+                        notice_key=f"repair:{target}:{kind}:{iid}", notice_kind="error",
                     )
                     record["repairAlerted"] = True
             self.db.execute(
@@ -795,6 +801,12 @@ class Catalog:
                 for extra in record.get("extraRecipients", []):
                     self.queue_event({**record, **extra}, files)
                 record.pop("extraRecipients", None)
+                if record.get("archiveAlerted"):
+                    self.notice(
+                        record["username"], "", self.target_recipients(settings, record["username"]),
+                        f"archive-recovered:{target}:{kind}:{iid}",
+                        notice_key=f"archive:{target}:{kind}:{iid}", notice_kind="recovery",
+                    )
                 record.update(status="ready", files=files, reason=None, failures=0, archiveAlerted=False)
             except Exception as error:
                 record["failures"] += 1
@@ -808,6 +820,7 @@ class Catalog:
                         f"TikTok @{record['username']} 內容下載失敗，原進度已保留，將持續重試。",
                         self.target_recipients(settings, record["username"]),
                         f'archive:{target}:{kind}:{iid}:{record["failures"]}',
+                        notice_key=f"archive:{target}:{kind}:{iid}", notice_kind="error",
                     )
                     record["archiveAlerted"] = True
             self.db.execute(
@@ -852,6 +865,8 @@ class Catalog:
                 continue
             if status == "pending":
                 pending += count
+                value = targets.setdefault(name, {}).setdefault(kind, {})
+                value["pending"] = count
             if status == "unresolved":
                 unresolved += count
                 value = targets.get(name, {}).get(kind)

@@ -138,7 +138,7 @@ test('corrupt JSON string fields and inherited lookup names never throw or leak 
   }
 });
 
-test('actual running and archival jobs receive detailed slots before newer retries', t => {
+test('actual running and archival jobs appear before retries and the queue', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'x-status-order-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const names = ['alice', 'bob', 'carol', 'dave', 'erin'];
@@ -151,11 +151,11 @@ test('actual running and archival jobs receive detailed slots before newer retri
     job({ id: 'queued', username: 'erin', status: 'queued', phase: 'queued', requestedAt: now + 3000 }),
   ] });
   const text = describeUser(settings, '100', dir);
-  assert.match(text, /目前：解析帳號與建立日期/);
-  assert.match(text, /目前：下載／檢查本機媒體/);
-  assert.ok(text.indexOf('歷史回補 @alice') < text.indexOf('歷史回補 @bob'));
-  assert.ok(text.indexOf('歷史回補 @dave') < text.indexOf('歷史回補 @bob'));
-  assert.ok(text.indexOf('歷史回補 @bob') < text.indexOf('歷史回補 @erin'));
+  assert.match(text, /進度：解析帳號與建立日期/);
+  assert.match(text, /進度：下載／檢查本機媒體/);
+  assert.ok(text.indexOf('處理中：@alice') < text.indexOf('處理中：@bob'));
+  assert.ok(text.indexOf('處理中：@dave') < text.indexOf('處理中：@bob'));
+  assert.ok(text.indexOf('處理中：@bob') < text.indexOf('排隊：@erin'));
 });
 
 test('corrupt report identity and ordering values cannot break the status command', t => {
@@ -180,10 +180,10 @@ test('shared active jobs are visible only for subscribed targets and detailed re
   atomic(path.join(dir, 'x/health.json'), { at: Date.now(), targets: [{ username: 'alice', saved: 2 }], pool: { active: 1, locked: 0 },
     historyJobs: [job({ id: 'same-job', username: 'alice', at: now }), job({ username: 'bob', reason: 'BOB_PRIVATE_ERROR' })] });
   const text = describeUser(settings, '100', dir);
-  assert.match(text, /歷史回補 @alice：執行中/);
-  assert.match(text, /目前：回覆補抓/);
-  assert.match(text, /貼文資料 120 篇/);
-  assert.equal(text.match(/歷史回補 @alice/g).length, 1);
+  assert.match(text, /處理中：@alice/);
+  assert.match(text, /進度：回覆補抓/);
+  assert.doesNotMatch(text, /貼文資料|分輪|完成視窗/);
+  assert.equal(text.match(/處理中：@alice/g).length, 1);
   assert.doesNotMatch(text, /bob|BOB_PRIVATE_ERROR/);
   assert.ok(text.length <= 3400);
 });
@@ -198,11 +198,11 @@ test('platform sections hide completed backfills and their pool, but keep active
   assert.doesNotMatch(text,/歷史回補 @|回補帳號池/);
   health.historyJobs.push(job({username:'alice',id:'active',status:'retry',phase:'waiting'}));
   atomic(path.join(dir,'x/health.json'),health);text=describeUser(settings,'100',dir);
-  assert.match(text,/回補帳號池：可用 2，限流等待 1/);
-  assert.equal(text.match(/歷史回補 @alice/g).length,1);
+  assert.doesNotMatch(text,/回補帳號池/);
+  assert.equal(text.match(/處理中：@alice/g).length,1);
   health.historyJobs=[job({username:'alice',status:'partial',phase:'archive',reported:false})];
   atomic(path.join(dir,'x/health.json'),health);
-  assert.match(describeUser(settings,'100',dir),/歷史回補 @alice/);
+  assert.match(describeUser(settings,'100',dir),/處理中：@alice/);
 });
 
 

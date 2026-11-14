@@ -172,13 +172,13 @@ test('X status scopes targets and jobs to each user and reports unavailable prog
   atomic(path.join(state, 'x/jobs/100-3-0.json'), { status: 'working', reason: 'X_NO_ACCOUNT_AVAILABLE', posts: 5, phase: 'search', progress: { completedWindows: 4, partialWindows: 1, failedWindows: 0 } });
   atomic(path.join(state, 'x/jobs/200-4-0.json'), { status: 'failed', reason: 'BOB_PRIVATE_ERROR' });
   const text = describeUser(s, '100', state);
-  assert.match(text, /X @alice/); assert.match(text, /已封存 8/); assert.match(text, /限流等待 1/);
-  assert.match(text, /5 篇/); assert.match(text, /完成視窗 4/);
+  assert.match(text, /@alice · 正常/); assert.match(text, /待下載：2/); assert.doesNotMatch(text, /回補帳號池|已封存/);
+  assert.match(text, /進度：搜尋歷史貼文/); assert.match(text, /預計完成：暫時無法估算/);
   assert.doesNotMatch(text, /X_NO_ACCOUNT_AVAILABLE/, 'old retry reasons are not current failures while work is running');
   assert.doesNotMatch(text, /bob|BOB_PRIVATE_ERROR/);
   atomic(path.join(state, 'x/jobs/100-3-0.json'), { status: 'retry', reason: 'X_NO_ACCOUNT_AVAILABLE', retryAt: Date.parse('2026-11-12T18:18:01Z'), posts: 5 });
-  assert.match(describeUser(s, '100', state), /等待重試.*X_NO_ACCOUNT_AVAILABLE/);
-  assert.match(describeUser(s, '100', state), /下次嘗試：香港時間.*02:18/);
+  assert.match(describeUser(s, '100', state), /等待重試/);
+  assert.doesNotMatch(describeUser(s, '100', state), /下次嘗試|X_NO_ACCOUNT_AVAILABLE/);
   fs.writeFileSync(path.join(state, 'x/jobs/100-3-0.json'), '{');
   assert.match(describeUser(s, '100', state), /讀取失敗/);
 });

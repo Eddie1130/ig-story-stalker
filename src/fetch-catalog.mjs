@@ -92,7 +92,7 @@ try {
     return {status:response.status,text:await response.text()};
   },{spec,tokens});
   stage='RESPONSE';
-  const decoded = decodeResponse(result);
+  const decoded = decodeResponse(result, { allowPostLocationImageError: plan.kind === 'posts' });
   let normalized;
   try { normalized = normalizeResponse(decoded,plan,config.target); }
   catch (error) {

@@ -1,3 +1,4 @@
+import { simpleXHistory } from './x-status.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -85,9 +86,10 @@ export class XWatcher {
     atomic(path.join(dir,id+'.json'),{version:1,id,...event});
     syncDirectory(dir);syncDirectory(this.dir);
   }
-  notice(text,name,identity=randomUUID(),userIds) {
+  notice(text,name,identity=randomUUID(),userIds,metadata={}) {
     const ids=userIds || (name ? this.subscriptions(name).map(s=>s.userId) : [this.settings().ownerId]);
-    this.emit({type:'notice',at:Date.now(),...(name?{username:name}:{}),text,recipients:[...new Set(ids)].map(userId=>({userId}))},identity);
+    const at=Math.max(Date.now(),(this.state.lastNoticeAt||0)+1);this.state.lastNoticeAt=at;
+    this.emit({type:'notice',at,...metadata,...(name?{username:name}:{}),text,recipients:[...new Set(ids)].map(userId=>({userId}))},identity);
   }
   async json(url) {
     let response;
@@ -124,13 +126,14 @@ export class XWatcher {
       archive={total:job.archiveKeys.length,done,remaining:job.archiveKeys.length-done,
         failed:job.archiveKeys.filter(key=>account.pending[key]?.failed).length,unit:'post'};
     }
+    if(archive&&!Number.isFinite(job.archiveStartedAt)){job.archiveStartedAt=now;job.archiveStartedDone=archive.done;}
     const terminal=['needs_start','failed','cancelled'].includes(job.status);
     const phase=terminal?job.status:job.status==='retry'?'waiting':job.status==='queued'?'queued':
       job.status==='importing'?'importing':job.reported?'finished':job.phase==='rendering'?'rendering':
       job.fetchDone?'archive':progress.lastWorkStage||progress.phase||progress.stage;
     return {version:1,id:job.id,username:job.username,status:job.status,at:now,requestedAt:job.at,start:job.start||progress.start,end:job.end,
       gap:!!job.gap&&!job.requestIds.length,reason:job.reason,retryAt:job.retryAt,posts:job.posts || progress.posts || 0,
-      phase,fetchDone:!!job.fetchDone,reported:!!job.reported,importedPosts:job.importedPosts,
+      phase,archiveStartedAt:job.archiveStartedAt,archiveStartedDone:job.archiveStartedDone,fetchDone:!!job.fetchDone,reported:!!job.reported,importedPosts:job.importedPosts,
       progressUpdatedAt:job.fetchDone?(job.archiveUpdatedAt||progress.at):progress.at,archive,
       progress:{completedWindows:progress.completedWindows??progress.window_status_counts?.done,
         totalWindows:progress.totalWindows,remainingWindows:progress.remainingWindows,
@@ -141,6 +144,10 @@ export class XWatcher {
   writeJob(job,now=Date.now()) {
     const report=this.historyReport(job,now);
     for(const id of job.requestIds) atomic(path.join(this.dir,'jobs',id+'.json'),{...report,requestId:id});
+    if((!job.gap||job.requestIds.length) && job.userIds.length && (active(job.status)||job.fetchDone&&!job.reported) && !['queued','failed','cancelled','needs_start'].includes(job.status) && now-(job.lastProgressNoticeAt||0)>=60000) {
+      this.notice(simpleXHistory(report,now),job.username,`${job.id}:progress:${now}`,job.userIds,{noticeKey:`history:${job.id}`,noticeKind:'progress'});
+      job.lastProgressNoticeAt=now;
+    }
   }
   syncRequests(now=Date.now()) {
     const s=this.settings();
@@ -202,7 +209,7 @@ export class XWatcher {
           }
           job.userIds=[...new Set([...job.userIds,...subscribers.map(s=>s.userId)])];
         }
-        if(a.failures>0)this.notice(`X @${name} 監控已恢復；${covered?'近期清單已涵蓋中斷期間':'仍可能有缺漏，已排入監控缺口補抓'}，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
+        if(a.failures>0)this.notice(`X @${name} 監控已恢復；${covered?'近期清單已涵蓋中斷期間':'仍可能有缺漏，已排入監控缺口補抓'}，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`,undefined,{noticeKey:`monitor:${name}`,noticeKind:'recovery'});
         delete a.gapStart;
       }
       const queuedGaps=Object.values(this.state.history).filter(j=>j.username===name&&j.gap&&!j.requestIds.length&&
@@ -237,7 +244,7 @@ export class XWatcher {
       a.failures++;a.reason=fetchReason;
       if(a.baseline) a.gapStart ||= a.lastSuccess;
       a.nextAt=now+Math.min(3600000,this.interval*2**Math.min(a.failures,6));
-      if(a.failures===1)this.notice(`X @${name} 監控異常：${a.reason}。將退避重試。`,name,`${name}:fetch:${now}`);
+      if(a.failures===1)this.notice(`X @${name} 監控異常：${a.reason}。將退避重試。`,name,`${name}:fetch:${now}`,undefined,{noticeKey:`monitor:${name}`,noticeKind:'error'});
       this.persist();
     }
   }
@@ -268,12 +275,12 @@ export class XWatcher {
           p.attempts=(p.attempts||0)+1;p.reason=safeReason(error);
           p.retryAt=now+300000;
           if(p.attempts>=3||['ENOSPC','EACCES','EROFS','X_UNSAFE_PATH'].includes(p.reason)) {
-            if(!a.archiveWarned)this.notice(`X @${name} 封存失敗：${p.reason}。內容仍在佇列等待重試。`,name,`${name}:archive:${key}:${now}`);
+            if(!a.archiveWarned)this.notice(`X @${name} 封存失敗：${p.reason}。內容仍在佇列等待重試。`,name,`${name}:archive:${key}:${now}`,undefined,{noticeKey:`archive:${name}`,noticeKind:'error'});
             a.archiveWarned=true;p.failed=true;
           }
         }
         if(a.archiveWarned&&!Object.values(a.pending).some(item=>item.failed)) {
-          this.notice(`X @${name} 封存已恢復。`,name,`${name}:archive-recovery:${now}`);a.archiveWarned=false;
+          this.notice(`X @${name} 封存已恢復。`,name,`${name}:archive-recovery:${now}`,undefined,{noticeKey:`archive:${name}`,noticeKind:'recovery'});a.archiveWarned=false;
         }
     }
     } finally {
@@ -413,7 +420,7 @@ export class XWatcher {
     }
     job.status='working';job.attempts++;this.persist();this.writeJob(job);
     if((!job.gap||job.requestIds.length)&&!job.startedNotified) {
-      this.notice(`X @${job.username} 歷史回補已開始，可從帳號選單查看進度。`,job.username,`${job.id}:started`,job.userIds);
+      this.notice(`X @${job.username} 歷史回補已開始，可從帳號選單查看進度。`,job.username,`${job.id}:started`,job.userIds,{noticeKey:`history:${job.id}`,noticeKind:'progress'});
       job.startedNotified=true;
     }
     this.historyTask=(async()=>{
@@ -441,7 +448,7 @@ export class XWatcher {
         if(job.reason==='X_NO_ACCOUNT_AVAILABLE') {job.attempts--;job.status='retry';}
         else job.status=job.attempts<(recoverable(job.reason)?6:3)?'retry':'failed';
         job.retryAt=Date.now()+Math.min(3600000,300000*2**Math.max(0,job.attempts-1));
-        if(job.status==='failed')this.notice(`X @${job.username} 歷史回補失敗：${job.reason}`,job.username,`${job.id}:error:${job.attempts}`,job.userIds);
+        if(job.status==='failed')this.notice(`X @${job.username} 歷史回補失敗：${job.reason}`,job.username,`${job.id}:error:${job.attempts}`,job.userIds,{noticeKey:`history:${job.id}`,noticeKind:'progress'});
       } finally {this.persist();this.writeJob(job);this.historyTask=null;}
     })();
   }
@@ -487,13 +494,13 @@ export class XWatcher {
         catch(error) {job.reason=safeReason(error);job.status='partial';}
       }
       const labels={complete:'搜尋流程已完成',partial:'部分完成，仍有未完成區段',needs_start:'無法取得建立日期，請用 /xhistory 指定起日',failed:'失敗'};
-      if(!job.gap||job.requestIds.length||job.status!=='complete')this.notice(`X @${job.username} 歷史回補：${labels[job.status]||job.status}；已匯入 ${job.posts||0} 篇並封存可取得的媒體。搜尋完成不代表歷史完整無缺。`,job.username,`${job.id}:result`,job.userIds);
+      if(!job.gap||job.requestIds.length||job.status!=='complete')this.notice(`X @${job.username} 歷史回補：${labels[job.status]||job.status}；已匯入 ${job.posts||0} 篇並封存可取得的媒體。搜尋完成不代表歷史完整無缺。`,job.username,`${job.id}:result`,job.userIds,{noticeKey:`history:${job.id}`,noticeKind:'progress'});
       job.reported=true;delete job.phase;this.persist();this.writeJob(job);
     }
   }
   health(now=Date.now()) {
     const running=Object.values(this.state.history).find(j=>['working','importing'].includes(j.status));
-    if(running)this.writeJob(running,now);
+    for(const job of Object.values(this.state.history)) if(active(job.status)||job.fetchDone&&!job.reported)this.writeJob(job,now);
     const data={at:now,enabled:true,phase:this.stopping?'stopped':'running',pool:this.state.pool,
       targets:this.names().map(username=>{const a=this.account(username);return {username,failures:a.failures,reason:a.reason,pending:Object.keys(a.pending).length,saved:Object.keys(a.seen).length-Object.keys(a.pending).length,lastSuccess:a.lastSuccess};}),
       history:running?{username:running.username,status:running.status}:null,
@@ -517,13 +524,13 @@ export class XWatcher {
         else if(nextAvailableAt)job.retryAt=nextAvailableAt+1000;
         this.writeJob(job,now);
       }
-      if(!pool.active&&this.state.poolEmptyChecks>=3&&!this.state.poolWarned){this.notice('X 歷史回補沒有可用登入帳號，請管理員在主機端更新 twscrape 帳號池。');this.state.poolWarned=true;}
-      if(pool.active&&this.state.poolWarned){this.notice('X 歷史回補帳號池已恢復可用。');this.state.poolWarned=false;}
+      if(!pool.active&&this.state.poolEmptyChecks>=3&&!this.state.poolWarned){this.notice('X 歷史回補沒有可用登入帳號，請管理員在主機端更新 twscrape 帳號池。',null,'pool-empty:'+now,undefined,{noticeKey:'pool',noticeKind:'error'});this.state.poolWarned=true;}
+      if(pool.active&&this.state.poolWarned){this.notice('X 歷史回補帳號池已恢復可用。',null,'pool-recovery:'+now,undefined,{noticeKey:'pool',noticeKind:'recovery'});this.state.poolWarned=false;}
     } catch(error) {
       if(this.stopping)return;
       this.state.pool={active:0,locked:0,reason:safeReason(error)};
       this.state.poolEmptyChecks=0;this.state.poolFailures=(this.state.poolFailures||0)+1;
-      if(this.state.poolFailures>=3&&!this.state.poolWarned){this.notice('X 帳號池狀態讀取失敗，請管理員檢查 accounts.db。');this.state.poolWarned=true;}
+      if(this.state.poolFailures>=3&&!this.state.poolWarned){this.notice('X 帳號池狀態讀取失敗，請管理員檢查 accounts.db。',null,'pool-failed:'+now,undefined,{noticeKey:'pool',noticeKind:'error'});this.state.poolWarned=true;}
     }
     this.state.poolNextAt=now+30000;this.persist();
   }

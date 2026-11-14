@@ -1,3 +1,4 @@
+import { platformMenu } from './platform-menu.mjs';
 import { tikTokLinkPattern, parseTikTokLink } from './tiktok-links.mjs';
 import { tikTokCallback, tikTokMessage } from './tiktok-menu.mjs';
 import { instagramLinks } from './instagram-links.mjs';
@@ -11,16 +12,19 @@ const button = (text, callback_data) => ({ text, callback_data });
 const panel = (text, rows) => ({ text, reply_markup: { inline_keyboard: rows } });
 const back = [button('⬅️ 主選單', 'menu')];
 export function mainMenu(user) {
-  return panel('Instagram／X／TikTok 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
+  return panel('Instagram／X／TikTok 監看設定\n直接傳送支援的內容連結即可下載。', [
     [button('📷 Instagram', 'ig:menu'), button('𝕏 X / Twitter', 'x:menu')],
-    [button('👥 監看帳號', 'list:0'), button('➕ 新增帳號', 'add')],
     [button('🎬 TikTok', 'tt:menu')],
-    [button('🔔 媒體通知', 'list:0')],
-    [button(`📋 每日摘要：${user.daily ? '開啟' : '關閉'}`, `daily:${user.daily ? 0 : 1}`)],
-    [button('🔗 連結下載', 'download')],
-    [button('📊 我的狀態', 'status')],
+    [button('🔔 通知', 'notifications'), button('📊 狀態', 'status')],
   ]);
 }
+function notificationMenu(user) {
+  return panel('🔔 我的全域通知設定\n只影響你的 Telegram；各帳號細項設定會保留，本機下載持續進行。\n異常仍會通知，恢復後自動清除。', [
+    [button(`媒體通知：${user.mediaNotifications === false ? '🔕 關閉' : '✅ 開啟'}`, `media:${user.mediaNotifications === false ? 1 : 0}`)],
+    [button(`每日摘要：${user.daily ? '✅ 開啟' : '🔕 關閉'}`, `daily:${user.daily ? 0 : 1}`)], back,
+  ]);
+}
+
 function accountMenu(user, name) {
   const sub = userTarget(user, name);
   if (!sub) return panel('此帳號已不在你的清單中。', [back]);
@@ -32,13 +36,7 @@ function accountMenu(user, name) {
     [button('⬅️ 帳號清單', 'list:0')], back,
   ]);
 }
-function listMenu(user, page = 0) {
-  const names = Object.keys(user.targets).sort(), last = Math.max(0, Math.ceil(names.length / 8) - 1);
-  page = Math.min(Math.max(0, page), last);
-  const rows = names.slice(page * 8, page * 8 + 8).map(name => [button('@' + name, 'account:' + name)]);
-  if (last) rows.push([...(page ? [button('上一頁', 'list:' + (page - 1))] : []), ...(page < last ? [button('下一頁', 'list:' + (page + 1))] : [])]);
-  return panel(names.length ? `你的監看帳號（${page + 1}/${last + 1}）\n點選帳號設定通知或移除。` : '尚未加入任何帳號。', [...rows, [button('➕ 新增帳號', 'add')], back]);
-}
+function listMenu(user, page = 0, overview) { return platformMenu(user, 'ig', page, overview); }
 
 // Mutate settings and enqueue replies in one durable transaction with the update offset.
 // Desired values and subscription generations make repeated/stale buttons harmless.
@@ -52,21 +50,32 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
   if (from?.is_bot || message?.chat?.type !== 'private' || String(message.chat.id) !== id || !settings.allowedIds.includes(id)) return true;
   const user = settings.users[id];
   if (!user) return true;
+  const inputMessageId = user.waitingMessageId;
+  const overview = platform => statusText.platform?.(id, platform);
   let result;
   if (callback) {
+    delete user.waiting; delete user.waitingMessageId;
     settings.replies[`ack:${update.update_id}`] = { method: 'answerCallbackQuery', body: { callback_query_id: callback.id }, userId: id, at: now };
     const parts = String(callback.data || '').split(':');
     const [action, name, kind, value, generation] = parts;
     if (action === 'ex') result = exportCallback(settings, id, callback.data, update.update_id, now, exportEnabled, exportAccounts);
-    else if (action === 'tt') result = tikTokCallback(user, callback.data, now);
-    else if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
-    else if (action === 'menu' || (action === 'ig' && name === 'menu')) { delete user.waiting; result = mainMenu(user); }
-    else if (action === 'list' && /^\d{1,5}$/.test(name)) result = listMenu(user, Number(name));
+    else if (action === 'tt') result = tikTokCallback(user, callback.data, now, overview('tt'));
+    else if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now, overview('x'));
+    else if (action === 'menu') { delete user.waiting; result = mainMenu(user); }
+    else if (action === 'ig' && name === 'menu') { delete user.waiting; result = listMenu(user, 0, overview('ig')); }
+    else if (action === 'notifications') result = notificationMenu(user);
+    else if (action === 'media' && ['0', '1'].includes(name)) {
+      const enabled = name === '1';
+      if (enabled && user.mediaNotifications === false) user.mediaNotificationsSince = now;
+      user.mediaNotifications = enabled;
+      result = notificationMenu(user);
+    }
+    else if (action === 'list' && /^\d{1,5}$/.test(name)) result = listMenu(user, Number(name), overview('ig'));
     else if (action === 'account' && validUsername(name)) result = accountMenu(user, name);
     else if (action === 'add') { user.waiting = 'add'; result = panel('請傳送要監看的 Instagram 使用者名稱，例如 alice 或 @alice。\n輸入 /cancel 可取消。', [back]); }
     else if (action === 'daily' && ['0', '1'].includes(name)) {
       user.daily = name === '1';
-      result = panel(`每日摘要已${user.daily ? '開啟，每天香港時間 20:00 發送。' : '關閉。'}\n異常與恢復通知仍會發送。`, [back]);
+      result = notificationMenu(user);
     } else if (action === 'download') {
       delete user.waiting;
       result = panel('直接貼上 Instagram、X 或 TikTok 貼文連結即可下載。\n每則訊息最多 10 個連結；貼上帳號首頁會先詢問是否加入監看。', [back]);
@@ -80,7 +89,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
       result = accountMenu(user, name);
     } else if (['remove', 'delete'].includes(action) && validUsername(name) && userTarget(user, name)?.generation.slice(0, 8) === kind) {
       if (action === 'remove') result = panel(`要從你的清單移除 @${name} 嗎？\n保留本機檔案及歷史紀錄；其他使用者的監看不受影響。`, [[button('確認移除', `delete:${name}:${kind}`)], [button('取消', 'account:' + name)]]);
-      else { delete user.targets[name]; result = listMenu(user); }
+      else { delete user.targets[name]; result = listMenu(user, 0, overview('ig')); }
     } else result = panel('此選單已過期，請重新選擇。', [back]);
   } else {
     const text = String(message.text || message.caption || '').trim();
@@ -142,7 +151,13 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     if (ttResult && result !== ttResult) result = combinePanels(result, ttResult);
     if (xResult && hasInstagramLinks(linkedText)) result = combinePanels(result, xResult);
   }
-  if (exportEnabled && id === settings.ownerId && result?.text?.startsWith('Instagram／X／TikTok 監看設定')) result.reply_markup.inline_keyboard.push([button('📦 管理員封存匯出', 'ex:platforms')]);
-  settings.replies[`reply:${update.update_id}`] = { method: 'sendMessage', body: { chat_id: id, ...result }, userId: id, at: now };
+  if (exportEnabled && id === settings.ownerId && result?.text?.startsWith('🔔 我的全域通知設定')) result.reply_markup.inline_keyboard.push([button('📦 管理員封存匯出', 'ex:platforms')]);
+  const messageId = callback?.message?.message_id || inputMessageId;
+  if (user.waiting && Number.isSafeInteger(messageId) && messageId > 0) user.waitingMessageId = messageId;
+  else delete user.waitingMessageId;
+  settings.replies[`reply:${update.update_id}`] = {
+    method: Number.isSafeInteger(messageId) && messageId > 0 ? 'editMessageText' : 'sendMessage',
+    body: { chat_id: id, ...(Number.isSafeInteger(messageId) && messageId > 0 ? { message_id: messageId } : {}), ...result }, userId: id, at: now, ...(user.waiting ? { inputPrompt: user.waiting } : {}),
+  };
   return true;
 }

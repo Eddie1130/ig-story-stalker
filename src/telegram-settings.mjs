@@ -33,6 +33,8 @@ export function validateSettings(s) {
   }
   for (const [id, user] of Object.entries(s.users)) {
     if (!userId(id) || !object(user) || typeof user.daily !== 'boolean' || !object(user.targets)) throw Error('TELEGRAM_SETTINGS_INVALID');
+    if (user.waitingMessageId !== undefined && (!Number.isSafeInteger(user.waitingMessageId) || user.waitingMessageId < 1)) throw Error('TELEGRAM_SETTINGS_INVALID');
+    if ((user.mediaNotifications !== undefined && typeof user.mediaNotifications !== 'boolean') || (user.mediaNotificationsSince !== undefined && !Number.isFinite(user.mediaNotificationsSince))) throw Error('TELEGRAM_SETTINGS_INVALID');
     for (const [name, sub] of Object.entries(user.targets)) {
       if (!validUsername(name) || !object(sub) || typeof sub.generation !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(sub.generation) ||
           !Number.isFinite(sub.joinedAt) || !object(sub.notifications)) throw Error('TELEGRAM_SETTINGS_INVALID');
@@ -93,4 +95,9 @@ export function alertText(s, id, alert) {
 }
 export function alertRecipients(s, alert) {
   return s.allowedIds.filter(id => isSystemAlert(alert) || (alert.usernames?.length ? alert.usernames : [alert.username]).some(name => subscribed(s, id, name)));
+}
+
+// Manual downloads and system alerts deliberately bypass the media master switch.
+export function mediaEnabled(user, at) {
+  return user?.mediaNotifications !== false && at >= (user?.mediaNotificationsSince || 0);
 }

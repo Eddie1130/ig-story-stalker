@@ -1,3 +1,5 @@
+import { updateNotice, noticeRecipients, validateNotices } from './telegram-notices.mjs';
+import { mediaEnabled } from './telegram-settings.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -21,6 +23,7 @@ function validateEvent(event) {
       (event.username !== undefined && !username(event.username))) throw Error('X_EVENT_INVALID');
   if (event.type === 'notice') {
     if (typeof event.text !== 'string' || event.text.length > 100000) throw Error('X_EVENT_INVALID');
+    if ((event.noticeKey !== undefined && (typeof event.noticeKey !== 'string' || event.noticeKey.length > 256)) || (event.noticeKind !== undefined && !['error', 'recovery', 'progress'].includes(event.noticeKind))) throw Error('X_EVENT_INVALID');
     return event;
   }
   const result = event.result;
@@ -66,6 +69,7 @@ export class XDelivery {
     this.file = path.join(dir, 'x-delivery.json');
     if (fs.existsSync(this.file + '.required') && !fs.existsSync(this.file)) throw Error('X_DELIVERY_HISTORY_MISSING');
     this.state = validateState(load(this.file, { version: 1, receipts: {} }));
+    validateNotices(this.state);
     for (const entry of Object.values(this.state.receipts)) {
       if (entry.inflight) { entry.uncertain = true; delete entry.inflight; }
     }
@@ -80,7 +84,7 @@ export class XDelivery {
     if (!settings.allowedIds.includes(recipient.userId)) return false;
     const user = Object.hasOwn(settings.users, recipient.userId) ? settings.users[recipient.userId] : undefined;
     const sub = user?.xTargets && Object.hasOwn(user.xTargets, event.username) ? user.xTargets[event.username] : undefined;
-    if (event.type === 'notice') return !event.username || !!sub;
+    if (event.type === 'notice') return event.noticeKind === 'recovery' && !!this.state.notices?.[JSON.stringify([recipient.userId, event.noticeKey])] || !event.username || !!sub;
     if (event.manual) {
       const request = settings.xRequests && Object.hasOwn(settings.xRequests, event.requestId) ? settings.xRequests[event.requestId] : undefined;
       if (recipient.userId !== event.userId || request?.type !== 'manual' || request.userId !== event.userId || request.username !== event.username) return false;
@@ -90,7 +94,7 @@ export class XDelivery {
       } catch { return false; }
     }
     const preference = sub?.notifications[event.kind];
-    return sub?.generation === recipient.generation && preference?.enabled === true && event.at >= sub.joinedAt && event.at >= preference.since;
+    return mediaEnabled(user, event.at) && sub?.generation === recipient.generation && preference?.enabled === true && event.at >= sub.joinedAt && event.at >= preference.since;
   }
   async upload(group, result, userId, documents) {
     const { xFile } = await import('./x-archive.mjs');
@@ -133,6 +137,15 @@ export class XDelivery {
   async deliver(client, event, recipient, entry, stopping) {
     if (entry.done || Date.now() < (entry.retryAt || 0)) return !entry.retryAt;
     if (!this.eligible(event, recipient)) { entry.done = true; this.persist(); return true; }
+    if (event.type === 'notice' && typeof event.noticeKey === 'string') {
+      try {
+        await updateNotice(client, this.state, JSON.stringify([recipient.userId, event.noticeKey]), { at: event.at, userId: recipient.userId, text: event.text, recovery: event.noticeKind === 'recovery' }, () => this.persist());
+        entry.done = true; delete entry.retryAt; this.persist(); return true;
+      } catch (error) {
+        if (!/^TELEGRAM_/.test(error.message)) throw error;
+        entry.failures++; entry.retryAt = Date.now() + 30000; this.persist(); return false;
+      }
+    }
     const result = event.result;
     const text = event.type === 'notice' ? event.text : [
       `[${event.kind.toUpperCase()}] @${event.username}`,
@@ -208,12 +221,15 @@ export class XDelivery {
     try { names = fs.readdirSync(directory).filter(name => /^[a-f0-9]{64}\.json$/.test(name)); }
     catch (error) { if (error.code === 'ENOENT') return true; throw error; }
     let count = 0, ok = true;
-    for (const name of names.sort()) {
-      if (stopping() || count >= limit) break;
+    const events = names.map(name => {
       const file = path.join(directory, name);
       if (fs.lstatSync(file).isSymbolicLink() || fs.statSync(file).size > 4000000) throw Error('X_EVENT_INVALID');
-      const event = validateEvent(load(file, null));
-      for (const recipient of event.recipients) {
+      return { file, event: validateEvent(load(file, null)) };
+    }).sort((a, b) => a.event.at - b.event.at || a.event.id.localeCompare(b.event.id));
+    for (const { file, event } of events) {
+      if (stopping() || count >= limit) break;
+      const recipients = noticeRecipients(this.state, event);
+      for (const recipient of recipients) {
         if (stopping() || count >= limit) break;
         const key = createHash('sha256').update(`${event.id}:${recipient.userId}`).digest('hex');
         const entry = this.state.receipts[key] ||= { nextText: 0, nextGroup: 0, failures: 0 };
@@ -221,6 +237,8 @@ export class XDelivery {
         count++;
         ok = await this.deliver(client, event, recipient, entry, stopping) && ok;
       }
+      if (event.type === 'notice' && event.noticeKey && recipients.every(recipient =>
+        this.state.receipts[createHash('sha256').update(`${event.id}:${recipient.userId}`).digest('hex')]?.done)) fs.unlinkSync(file);
     }
     return ok;
   }

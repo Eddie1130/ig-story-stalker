@@ -1,5 +1,5 @@
 import { telegramApiBase } from './telegram-endpoint.mjs';
-import { sendControlFallback } from './telegram-fallback.mjs';
+import { sendControlFallback, clearControlFallback } from './telegram-fallback.mjs';
 import { controlEnabled, readSettings, settingsFile } from './telegram-settings.mjs';
 import { publishEvent, eventDirectory, controlHeartbeat } from './telegram-events.mjs';
 import { formatJST } from './time-jst.mjs';
@@ -52,7 +52,7 @@ async function main() {
       status.telegramOk = controller?.telegramOk === true;
       if (controller) {
         issues.resolve('telegram-control');
-        if (state.controlFallbackSent) { delete state.controlFallbackSent; persist(); }
+        if (state.controlFallbackSent || state.controlFallbackMessages) await clearControlFallback({ state, token, signal: abort.signal, persist });
       } else if (Date.now() - started > 120000) {
         issues.fail('telegram-control', 'CONTROL_HEARTBEAT_STALE');
         // The command service also delivers notifications. An independent direct

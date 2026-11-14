@@ -111,3 +111,27 @@ export function compactXHistory(value) {
   const job = presentableJob(value);
   return `${heading(job)}；${currentAction(job)}`.slice(0, 180);
 }
+
+
+// Keep the detailed formatter for diagnostics; the Telegram status page uses this summary.
+export function simpleXHistory(value, now = Date.now()) {
+  const job = presentableJob(value);
+  const progress = job.progress || {};
+  let detail = currentAction(job), eta = null;
+  const done = count(progress.completedWindows), total = count(progress.totalWindows);
+  if (job.phase === 'search' && done !== null && total > 0) detail += ` · ${Math.min(99, Math.floor(done / total * 100))}%`;
+  const archive = job.archive;
+  if (job.phase === 'archive' && archive?.unit === 'post' && count(archive.done) !== null && count(archive.total) !== null) {
+    detail += ` · ${Math.min(archive.done, archive.total)}/${archive.total} 篇`;
+    // Estimate total completion only after search/import are done and a measurable archive sample exists.
+    const start = job.archiveStartedAt, initial = count(job.archiveStartedDone);
+    const updated = job.progressUpdatedAt;
+    if (validTimestamp(start) && initial !== null && archive.done > initial && archive.done < archive.total && !archive.failed &&
+        validTimestamp(updated) && updated <= now && now - updated <= 300000 && updated > start && job.status !== 'retry') {
+      eta = now + (updated - start) / (archive.done - initial) * (archive.total - archive.done);
+    }
+  }
+  if (validTimestamp(job.progressUpdatedAt) && now - job.progressUpdatedAt > 300000) detail += ' · 狀態未更新';
+  const estimate = validTimestamp(eta) ? `約 ${hongKongTime.format(new Date(eta))}（香港時間）` : '暫時無法估算';
+  return `處理中：@${username(job.username)}\n進度：${detail}\n預計完成：${estimate}`;
+}
