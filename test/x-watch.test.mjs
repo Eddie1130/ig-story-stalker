@@ -34,7 +34,7 @@ test('sustained fetch failures preserve baseline and recover with a durable quie
   const f=fixture(t);await f.watcher.cycle(1700000000000);f.fail(true);await f.watcher.cycle(1700000061000);
   await f.watcher.cycle(1700000121000);await f.watcher.cycle(1700000181000);
   assert.ok(f.watcher.state.accounts.alice.gapStart);
-  f.fail(false);f.set([post('2')]);await f.watcher.cycle(1700004000000);
+  f.fail(false);f.set(Array.from({length:100},(_,i)=>post(String(i+2))));await f.watcher.cycle(1700004000000);
   assert.ok(Object.values(f.watcher.state.history).some(j=>j.username==='alice'&&j.gap));
   assert.ok(events(f).some(e=>e.type==='notice'&&/恢復/.test(e.text)));
   assert.equal(events(f).filter(e=>e.type==='post').length,0,'recovery snapshots stay quiet');
@@ -104,10 +104,10 @@ test('missing start date is actionable and failed history retries without losing
   assert.equal(retry.status,'retry');assert.equal(retry.attempts,0,'pool rate locks do not consume the failure budget');
   assert.equal(events(f).filter(e=>/歷史回補暫停/.test(e.text||'')).length,0);
 });
-test('container downtime schedules quiet gap catch-up even without a recorded fetch error',async t=>{
+test('container downtime uses the normal timeline when it covers the gap',async t=>{
   const f=fixture(t);await f.watcher.cycle(1700000000000);f.set([post('2')]);
   const restarted=new XWatcher({...f,settings:()=>f.settings});await restarted.cycle(1700010000000);
-  assert.equal(Object.values(restarted.state.history).filter(j=>j.gap).length,1);
+  assert.equal(Object.values(restarted.state.history).filter(j=>j.gap).length,0);
   assert.equal(events(f).filter(e=>e.type==='post').length,0);
 });
 test('removing the last authorized requester cancels a running history before further import',async t=>{
@@ -249,7 +249,7 @@ test('a tolerated 404 does not hide a later downtime gap',async t=>{
   await f.watcher.pollAccount('alice',1700000060000);
   f.watcher.fetchImpl=f.fetchImpl;
   await f.watcher.pollAccount('alice',1700100000000);
-  assert.ok(Object.values(f.watcher.state.history).some(j=>j.gap));
+  assert.equal(Object.values(f.watcher.state.history).length,0);
 });
 
 for(const status of [500,502,503,429,'network'])test(`${status} waits for three consecutive failures across restarts`,async t=>{
@@ -367,4 +367,46 @@ test('real history worker timeout responses get six quiet attempts',async t=>{
     assert.equal(job.status,i<6?'retry':'failed');
     assert.equal(events(f).filter(e=>/歷史回補失敗/.test(e.text)).length,i<6?0:1);
   }
+});
+
+
+test('a full recovery timeline reconnects to the saved checkpoint across restart', async t=>{
+  const f=fixture(t),now=1700000000000;
+  await f.watcher.pollAccount('alice',now);
+  f.set([...Array.from({length:99},(_,i)=>post(String(i+2))),post('1')]);
+  const restarted=new XWatcher({...f,settings:()=>f.settings});
+  await restarted.pollAccount('alice',now+3600000);
+  assert.equal(Object.keys(restarted.state.history).length,0);
+  assert.equal(Object.keys(restarted.account('alice').pending).length,100);
+});
+
+test('legacy automatic queued gaps are rechecked but explicit requests are preserved',async t=>{
+  const f=fixture(t),now=1700000000000;
+  await f.watcher.pollAccount('alice',now);
+  const auto=f.watcher.enqueueHistory({username:'alice',start:'2023-11-14',end:'2023-11-15',gap:true},now);
+  auto.status='retry';auto.reason='X_NO_ACCOUNT_AVAILABLE';
+  const explicit=f.watcher.enqueueHistory({username:'alice',userId:'100',requestId:'100-1-0',start:'2020-01-01'},now);
+  f.set([post('2'),post('1')]);await f.watcher.pollAccount('alice',now+60000);
+  assert.equal(auto.status,'cancelled');
+  assert.equal(auto.reason,'X_GAP_COVERED_BY_TIMELINE');
+  assert.equal(explicit.status,'queued');
+});
+
+test('uncovered gaps merge only pending automatic work and retain the earliest checkpoint',async t=>{
+  const f=fixture(t),now=1700000000000;
+  await f.watcher.pollAccount('alice',now);
+  f.set(Array.from({length:100},(_,i)=>post(String(i+2))));
+  await f.watcher.pollAccount('alice',now+86400000);
+  const job=Object.values(f.watcher.state.history)[0];
+  f.set(Array.from({length:100},(_,i)=>post(String(i+102))));
+  await f.watcher.pollAccount('alice',now+172800000);
+  assert.equal(Object.keys(f.watcher.state.history).length,1);
+  assert.equal(job.start,'2023-11-14');assert.equal(job.end,'2023-11-17');
+  assert.equal(job.gapSince,now);
+});
+
+test('empty timelines cannot silently discard a gap',async t=>{
+  const f=fixture(t),now=1700000000000;await f.watcher.pollAccount('alice',now);
+  f.set([]);await f.watcher.pollAccount('alice',now+3600000);
+  assert.equal(Object.values(f.watcher.state.history).filter(j=>j.gap).length,1);
 });

@@ -204,3 +204,10 @@ test('platform sections hide completed backfills and their pool, but keep active
   atomic(path.join(dir,'x/health.json'),health);
   assert.match(describeUser(settings,'100',dir),/歷史回補 @alice/);
 });
+
+
+test('automatic gap reports have a distinct label',()=>{
+  assert.match(formatXHistory({username:'alice',status:'retry',gap:true}),/^監控缺口補抓 @alice/);
+  assert.match(compactXHistory({username:'alice',status:'queued',gap:true}),/^監控缺口補抓 @alice/);
+  assert.match(formatXHistory({username:'alice',status:'queued',gap:false}),/^歷史回補 @alice/);
+});
