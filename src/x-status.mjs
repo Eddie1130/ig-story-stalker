@@ -31,7 +31,7 @@ function heading(job) {
   const successful = ['complete', 'ready'].includes(job.status);
   const label = job.phase === 'finished' && job.reported === true && successful ? '封存完成' :
     ['archive', 'rendering'].includes(job.phase) && successful ? '封存中（搜尋完成）' : ownLabel(statusLabels, job.status) || '狀態待確認';
-  return `歷史回補 @${username(job.username)}：${label}${reason}${posts === null ? '' : `；貼文資料 ${posts} 篇`}`;
+  return `${job.gap === true ? '監控缺口補抓' : '歷史回補'} @${username(job.username)}：${label}${reason}${posts === null ? '' : `；貼文資料 ${posts} 篇`}`;
 }
 function windowProgress(job) {
   const progress = job.progress || {};

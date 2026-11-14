@@ -108,7 +108,7 @@ export class XWatcher {
       job.status==='importing'?'importing':job.reported?'finished':job.phase==='rendering'?'rendering':
       job.fetchDone?'archive':progress.lastWorkStage||progress.phase||progress.stage;
     return {version:1,id:job.id,username:job.username,status:job.status,at:now,requestedAt:job.at,start:job.start||progress.start,end:job.end,
-      reason:job.reason,retryAt:job.retryAt,posts:job.posts || progress.posts || 0,
+      gap:!!job.gap&&!job.requestIds.length,reason:job.reason,retryAt:job.retryAt,posts:job.posts || progress.posts || 0,
       phase,fetchDone:!!job.fetchDone,reported:!!job.reported,importedPosts:job.importedPosts,
       progressUpdatedAt:job.fetchDone?(job.archiveUpdatedAt||progress.at):progress.at,archive,
       progress:{completedWindows:progress.completedWindows??progress.window_status_counts?.done,
@@ -145,6 +145,18 @@ export class XWatcher {
       const payload=await this.json(`https://api.fxtwitter.com/2/profile/${name}/statuses?count=100&with_replies=1`);
       const rows=normalizeFxTimeline(payload,name);
       const oldGenerations={...a.generations};
+      // Use the unfiltered response size: normalization may remove unrelated rows.
+      const rawRows=payload.results.flatMap(row=>row?.type==='thread'?row.statuses:[row]);
+      const shortTimeline=rows.length>0&&rawRows.length<100;
+      const covers=anchor=>shortTimeline||!!(anchor&&rows.some(e=>eventKey(e)===anchor));
+      // Recheck old automatic jobs on every successful poll, including after upgrades.
+      // A new checkpoint must never dismiss an older unresolved gap.
+      for(const job of Object.values(this.state.history)) {
+        if(job.username!==name||!job.gap||job.requestIds.length||!['queued','retry'].includes(job.status))continue;
+        if(covers(job.gapAnchor)) {
+          job.status='cancelled';job.reason='X_GAP_COVERED_BY_TIMELINE';job.reported=true;
+        }
+      }
       // Snapshot the intent before archiving: interrupted downloads must not lose recipients.
       for(const e of rows) {
         const key=eventKey(e);if(a.seen[key])continue;
@@ -155,11 +167,38 @@ export class XWatcher {
       for(const {userId,sub} of subscribers)a.generations[userId]=sub.generation;
       for(const id of Object.keys(a.generations))if(!subscribers.some(s=>s.userId===id))delete a.generations[id];
       if(a.gapStart) {
-        const job=this.enqueueHistory({username:name,start:day(a.gapStart),end:nextDay(now),gap:true},now);
-        job.userIds=[...new Set([...job.userIds,...subscribers.map(s=>s.userId)])];
-        if(a.failures>0)this.notice(`X @${name} 監控已恢復；中斷期間已排入歷史補抓，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
+        const covered=covers(a.timelineAnchor);
+        if(!covered) {
+          // Only widen work that has not started; never change a running search's range.
+          let job=Object.values(this.state.history).find(j=>j.username===name&&j.gap&&!j.requestIds.length&&
+            !j.cancelRequested&&['queued','retry'].includes(j.status));
+          if(job) {job.start=job.start<day(a.gapStart)?job.start:day(a.gapStart);job.end=job.end>nextDay(now)?job.end:nextDay(now);}
+          else {
+            job=this.enqueueHistory({username:name,start:day(a.gapStart),end:nextDay(now),gap:true},now);
+            job.gapSince=a.gapStart;job.gapAnchor=a.timelineAnchor;
+          }
+          job.userIds=[...new Set([...job.userIds,...subscribers.map(s=>s.userId)])];
+        }
+        if(a.failures>0)this.notice(`X @${name} 監控已恢復；${covered?'近期清單已涵蓋中斷期間':'仍可能有缺漏，已排入監控缺口補抓'}，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
         delete a.gapStart;
       }
+      const queuedGaps=Object.values(this.state.history).filter(j=>j.username===name&&j.gap&&!j.requestIds.length&&
+        !j.cancelRequested&&['queued','retry'].includes(j.status)).sort((left,right)=>left.at-right.at);
+      const merged=queuedGaps[0];
+      for(const duplicate of queuedGaps.slice(1)) {
+        if(duplicate.start<merged.start) {
+          merged.start=duplicate.start;merged.gapSince=duplicate.gapSince;merged.gapAnchor=duplicate.gapAnchor;
+        } else if(duplicate.start===merged.start&&(!duplicate.gapSince||duplicate.gapSince<(merged.gapSince||Infinity))) {
+          merged.gapSince=duplicate.gapSince;merged.gapAnchor=duplicate.gapAnchor;
+        }
+        if(duplicate.end>merged.end)merged.end=duplicate.end;
+        merged.userIds=[...new Set([...merged.userIds,...duplicate.userIds])];
+        duplicate.status='cancelled';duplicate.reason='X_GAP_MERGED';duplicate.reported=true;
+      }
+      // Keep an anchor from the last successful timeline, independent of history imports.
+      const latest=rows.filter(e=>e.kind!=='repost'&&Number.isFinite(e.publishedAt))
+        .sort((left,right)=>right.publishedAt-left.publishedAt|| (BigInt(left.statusId)>BigInt(right.statusId)?-1:1))[0];
+      a.timelineAnchor=latest?eventKey(latest):null;
       a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;a.consecutive404=0;a.consecutiveTransient=0;delete a.reason;
       this.persist();
     } catch(error) {
