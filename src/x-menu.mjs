@@ -23,6 +23,7 @@ function xAccountMenu(user, name) {
     ...xKinds.map(kind => [button(`${labels[kind]}：${sub.notifications[kind].enabled ? '✅ 開啟' : '🔕 關閉'}`, `x:set:${name}:${kind}:${sub.notifications[kind].enabled ? 0 : 1}:${gen}`)]),
     [button('🗂 一鍵歷史回補', `x:history:${name}:${gen}`)],
     [button('📅 指定回補日期', `x:dates:${name}:${gen}`)],
+    [button('📦 匯出全部封存', `ex:preview:x:${name}`)],
     [button('🗑 移除監看', `x:remove:${name}:${gen}`)],
     [button('⬅️ X 帳號清單', 'x:list:0')], back,
   ]);

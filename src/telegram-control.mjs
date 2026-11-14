@@ -13,6 +13,7 @@ import { PersonalDelivery } from './telegram-delivery.mjs';
 import { TelegramClient } from './telegram-client.mjs';
 import { XDelivery } from './x-delivery.mjs';
 import { formatXHistory, compactXHistory } from './x-status.mjs';
+import { ingestExportReports, exportServiceReady } from './archive-export.mjs';
 
 export function describeUser(settings, id, stateDir, watchdogDir = null) {
   let readErrors = 0;
@@ -147,11 +148,17 @@ export async function run({ env = process.env, args = process.argv } = {}) {
           if (!Array.isArray(updates)) throw Error('TELEGRAM_UPDATES_INVALID');
           for (const update of updates) {
             const candidate = structuredClone(settings);
-            if (applyUpdate(candidate, update, Date.now(), describe)) {
+            if (applyUpdate(candidate, update, Date.now(), describe, env.ARCHIVE_EXPORT_ENABLED === '1' && exportServiceReady(env.EXPORT_DIR || '/exports'))) {
               atomic(settingsFile(env), candidate); settings = candidate;
             }
           }
           lastPollAt = Date.now(); pollOk = true;
+          if (env.ARCHIVE_EXPORT_ENABLED === '1') {
+            let candidate = structuredClone(settings), imported = false;
+            try { imported = ingestExportReports(candidate, env.EXPORT_DIR || '/exports'); }
+            catch { log('ARCHIVE_EXPORT_REPORT_FAILED', { reason: 'EXPORT_STATE_OR_IO_ERROR' }); }
+            if (imported) { atomic(settingsFile(env), candidate); settings = candidate; }
+          }
           await flushReplies(settings, client, persistSettings, { stopping: () => stopping, log });
         } catch (error) {
           if (stopping) return;

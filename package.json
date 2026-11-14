@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "check": "node --check src/*.mjs",
-    "test": "npm run check && node --test"
+    "test": "npm run check && node --test",
+    "test:export": "python3 -m unittest discover -s test -p runtime_export.py -v"
   },
   "engines": {
     "node": ">=22"

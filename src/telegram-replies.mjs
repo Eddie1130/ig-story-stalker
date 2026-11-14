@@ -1,8 +1,10 @@
+import { validExportReply } from './archive-export.mjs';
+
 export async function flushReplies(settings, client, persist, { stopping = () => false, log = () => {} } = {}) {
   let ok = true;
   for (const [key, reply] of Object.entries(settings.replies)) {
     if (stopping()) break;
-    if (!settings.allowedIds.includes(reply.userId)) { delete settings.replies[key]; persist(); continue; }
+    if (!settings.allowedIds.includes(reply.userId) || !validExportReply(settings, reply)) { delete settings.replies[key]; persist(); continue; }
     if (!['sendMessage', 'answerCallbackQuery'].includes(reply.method) || (reply.method === 'sendMessage' && String(reply.body?.chat_id) !== reply.userId)) throw Error('TELEGRAM_REPLY_INVALID');
     if (Date.now() < (reply.retryAt || 0)) { ok = false; continue; }
     try { await client.call(reply.method, reply.body); }

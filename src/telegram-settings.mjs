@@ -6,6 +6,7 @@ import { atomic, load } from './error-monitor.mjs';
 import { configuredTargets } from './target-config.mjs';
 import { validateTikTokSettings, seedTikTok, migrateTikTokContent } from './tiktok-settings.mjs';
 import { validateXSettings, configuredXTargets } from './x-settings.mjs';
+import { validateExportSettings } from './archive-export.mjs';
 
 export const kinds = ['story', 'post', 'highlight'];
 export const validUsername = name => typeof name === 'string' && /^[a-z0-9_.]{1,30}$/.test(name) && !['.', '..'].includes(name);
@@ -41,6 +42,7 @@ export function validateSettings(s) {
   for (const [name, id] of Object.entries(s.legacyIds)) if (!validUsername(name) || !/^\d+$/.test(id)) throw Error('TELEGRAM_SETTINGS_INVALID');
   validateXSettings(s);
   validateTikTokSettings(s);
+  validateExportSettings(s);
   return s;
 }
 export function readSettings(file) {

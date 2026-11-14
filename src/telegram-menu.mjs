@@ -4,6 +4,7 @@ import { instagramLinks } from './instagram-links.mjs';
 import { kinds, validUsername, userTarget, put } from './telegram-settings.mjs';
 import { subscription } from './telegram-settings.mjs';
 import { xCallback, xMessage, xLinkPattern, hasInstagramLinks, combinePanels } from './x-menu.mjs';
+import { exportCallback } from './archive-export.mjs';
 
 const labels = { story: 'Story', post: '貼文', highlight: '精選' };
 const button = (text, callback_data) => ({ text, callback_data });
@@ -26,6 +27,7 @@ function accountMenu(user, name) {
   const gen = sub.generation.slice(0, 8);
   return panel(`@${name}\n個人通知設定（本機下載持續進行）`, [
     ...kinds.map(kind => [button(`${labels[kind]}：${sub.notifications[kind].enabled ? '✅ 開啟' : '🔕 關閉'}`, `set:${name}:${kind}:${sub.notifications[kind].enabled ? 0 : 1}:${gen}`)]),
+    [button('📦 匯出全部封存', `ex:preview:ig:${name}`)],
     [button('🗑 移除監看', `remove:${name}:${gen}`)],
     [button('⬅️ 帳號清單', 'list:0')], back,
   ]);
@@ -40,7 +42,7 @@ function listMenu(user, page = 0) {
 
 // Mutate settings and enqueue replies in one durable transaction with the update offset.
 // Desired values and subscription generations make repeated/stale buttons harmless.
-export function applyUpdate(settings, update, now = Date.now(), statusText = () => '狀態暫時無法取得。') {
+export function applyUpdate(settings, update, now = Date.now(), statusText = () => '狀態暫時無法取得。', exportEnabled = false) {
   if (!Number.isSafeInteger(update?.update_id) || update.update_id < settings.offset) return false;
   const callback = update.callback_query;
   const message = callback?.message || update.message;
@@ -55,7 +57,8 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     settings.replies[`ack:${update.update_id}`] = { method: 'answerCallbackQuery', body: { callback_query_id: callback.id }, userId: id, at: now };
     const parts = String(callback.data || '').split(':');
     const [action, name, kind, value, generation] = parts;
-    if (action === 'tt') result = tikTokCallback(user, callback.data, now);
+    if (action === 'ex') result = exportCallback(settings, id, callback.data, update.update_id, now, exportEnabled);
+    else if (action === 'tt') result = tikTokCallback(user, callback.data, now);
     else if (action === 'x') result = xCallback(settings, user, id, callback.data, update.update_id, now);
     else if (action === 'menu' || (action === 'ig' && name === 'menu')) { delete user.waiting; result = mainMenu(user); }
     else if (action === 'list' && /^\d{1,5}$/.test(name)) result = listMenu(user, Number(name));
@@ -139,6 +142,7 @@ export function applyUpdate(settings, update, now = Date.now(), statusText = () 
     if (ttResult && result !== ttResult) result = combinePanels(result, ttResult);
     if (xResult && hasInstagramLinks(linkedText)) result = combinePanels(result, xResult);
   }
+  if (exportEnabled && id === settings.ownerId && result?.text?.startsWith('Instagram／X／TikTok 監看設定')) result.reply_markup.inline_keyboard.push([button('📦 管理員封存匯出', 'ex:platforms')]);
   settings.replies[`reply:${update.update_id}`] = { method: 'sendMessage', body: { chat_id: id, ...result }, userId: id, at: now };
   return true;
 }

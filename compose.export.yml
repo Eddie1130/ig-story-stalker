@@ -1,0 +1,62 @@
+services:
+  archive-export:
+    profiles: [archive-export]
+    build:
+      context: .
+      dockerfile: Dockerfile.export
+    init: true
+    environment:
+      ARCHIVE_EXPORT_BASE_URL: ${ARCHIVE_EXPORT_BASE_URL:-https://download.eddieli1130.dpdns.org}
+      IG_ARCHIVE_DIR: /downloads
+      IG_STATE_DIR: /watch
+      IG_CONTROL_DIR: /control
+      EXPORT_DIR: /exports
+      EXPORT_BIND: 0.0.0.0
+      EXPORT_PORT: "8090"
+    volumes:
+      - ./export_service:/app/export_service:ro
+      - ${IG_DOWNLOAD_DIR:-./downloads}:/downloads:ro
+      - ${IG_DATA_DIR:-./data}/watch:/watch:ro
+      - ${IG_DATA_DIR:-./data}/control:/control:ro
+      - ${IG_EXPORT_DIR:-./data/exports}:/exports
+    restart: unless-stopped
+    stop_grace_period: 45s
+    healthcheck:
+      test: [CMD, python, -c, "import json,time; h=json.load(open('/exports/health.json')); assert time.time()*1000-h['at']<120000"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  archive-tunnel:
+    profiles: [archive-tunnel]
+    image: cloudflare/cloudflared:2026.2.0
+    # The narrowly scoped token file stays 0600 on Linux NAS hosts.
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [tunnel, --no-autoupdate, --loglevel, fatal, --metrics, "0.0.0.0:2000", run, --token-file, /run/secrets/tunnel-token]
+    volumes:
+      - ${CLOUDFLARE_TUNNEL_TOKEN_FILE:-./data/cloudflare/tunnel-token}:/run/secrets/tunnel-token:ro
+    depends_on:
+      archive-export:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  ig-telegram:
+    environment:
+      ARCHIVE_EXPORT_ENABLED: ${ARCHIVE_EXPORT_ENABLED:-0}
+      EXPORT_DIR: /exports
+    volumes:
+      - ${IG_EXPORT_DIR:-./data/exports}:/exports:ro

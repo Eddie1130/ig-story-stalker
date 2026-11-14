@@ -412,6 +412,8 @@ mount are present:
 
 ## Configuration
 
+完整帳號封存 ZIP 匯出、24 小時 HTTPS 下載連結及 Mac／NAS 的 Cloudflare Tunnel 部署，見 [封存匯出說明](docs/archive-export.md)。
+
 | Variable | File | Required | Description |
 | --- | --- | --- | --- |
 | `IG_TARGET_USERNAMES` | `.env` | Unless legacy target is supplied | Comma-separated usernames; takes precedence over legacy variables |
