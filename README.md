@@ -490,6 +490,8 @@ invited collaborators and unrelated accounts are rejected. The network guard blo
 
 ## Troubleshooting
 
+Instagram 的 Story、貼文／精選查詢、媒體下載及傳送遇到可恢復錯誤時，連續失敗三次才列為異常並通知一次；前兩次安靜重試。成功後會重設次數，只有已發出告警的問題才發恢復通知。計數按帳號及工作分開並保存於監控狀態；Telegram 限流等待本身不算新失敗。登入失效、磁碟／權限及資料完整性問題仍立即告警。TikTok 的同類規則見 [TikTok integration](docs/tiktok-integration.md)。
+
 ### `SESSION_INVALID`
 
 Run the temporary login container again. Instagram may have expired the session or requested a checkpoint.

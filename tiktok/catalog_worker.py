@@ -15,7 +15,7 @@ import time
 from catalog_provider import identifier, media_url
 from catalog_media import delivery_parts
 from catalog_layout import migrate_media_layout, account_media
-from worker import atomic, cookies, subscriptions
+from worker import atomic, cookies, subscriptions, needs_attention
 
 KINDS = ("story", "post", "repost", "profile", "like")
 PERIOD = {"post": 300, "repost": 300, "story": 120, "profile": 1800, "like": 600}
@@ -399,7 +399,6 @@ class Catalog:
                 if more and str(result["cursor"]) == state.get("cursor", "0"):
                     raise RuntimeError("TIKTOK_PAGINATION_STALLED")
             all_known = bool(rows)
-            new_unresolved = []
             for item in rows:
                 iid = item["id"]
                 if kind != "profile":
@@ -517,8 +516,6 @@ class Catalog:
                     "failures": 0,
                     "retryAt": 0,
                 }
-                if item.get("unresolvedReason"):
-                    new_unresolved.append(iid)
                 self.db.execute(
                     "INSERT INTO items VALUES(?,?,?,?)",
                     (uid, kind, iid, json.dumps(record)),
@@ -530,25 +527,7 @@ class Catalog:
                 and state.get("cursor", "0") != "0"
             ):
                 raise RuntimeError("TIKTOK_PAGINATION_DUPLICATE")
-            remaining = [
-                iid
-                for iid in new_unresolved
-                if json.loads(
-                    self.db.execute(
-                        "SELECT data FROM items WHERE target=? AND kind=? AND id=?",
-                        (uid, kind, iid),
-                    ).fetchone()[0]
-                )["status"]
-                == "unresolved"
-            ]
-            if remaining:
-                self.notice(
-                    name,
-                    f"TikTok @{name} {kind} 有 {len(remaining)} 筆內容待補查，其餘內容會繼續封存。",
-                    recipients,
-                    f"partial:{uid}:{kind}:" + ",".join(remaining),
-                )
-            if state["failures"]:
+            if state.get("alerted", state["failures"] >= 3):
                 self.notice(
                     name,
                     f"TikTok @{name} {kind} 監控已恢復。",
@@ -562,6 +541,7 @@ class Catalog:
                 cursor="0" if finished else str(result["cursor"]),
                 baseline=state["baseline"] or finished,
                 failures=0,
+                alerted=False,
                 reason=None,
                 lastSuccess=now,
                 nextAt=now + (PERIOD[kind] * 1000 if finished else 30000),
@@ -577,21 +557,25 @@ class Catalog:
         except Exception as error:
             self.db.rollback()
             state["failures"] += 1
+            previous_reason = state.get("reason")
             state["reason"] = (
                 str(error)
                 if isinstance(error, RuntimeError) and str(error).startswith("TIKTOK_")
                 else "TIKTOK_CATALOG_FETCH_FAILED"
             )
-            state["phase"] = "異常／重試中"
+            abnormal = state.get("alerted") or state["failures"] >= 3 or needs_attention(error)
+            state["phase"] = "異常／重試中" if abnormal else f"等待重試（{state['failures']}/3）"
             state["nextAt"] = now + min(3600000, 30000 * 2 ** min(state["failures"], 6))
             self.save_stream(name, kind, state)
-            if state["failures"] == 1 or state["failures"] % 30 == 0:
+            if abnormal and (not state.get("alerted") or needs_attention(error) and state["reason"] != previous_reason):
                 self.notice(
                     name,
                     f"TikTok @{name} {kind} 監控失敗：{state['reason']}，將持續重試。",
                     recipients,
                     f"error:{name}:{kind}:{now}",
                 )
+                state["alerted"] = True
+                self.save_stream(name, kind, state)
             self.db.commit()
 
     def repair(self, settings, limit=1):
@@ -623,12 +607,13 @@ class Catalog:
                 record.update(
                     item=item, status="pending", reason=None, failures=0, retryAt=0
                 )
-                self.notice(
-                    record["username"],
-                    f"TikTok @{record['username']} 有一筆待補查內容已恢復，將繼續下載。",
-                    self.target_recipients(settings, record["username"]),
-                    f"repaired:{target}:{kind}:{iid}:{record['at']}",
-                )
+                if record.pop("repairAlerted", False):
+                    self.notice(
+                        record["username"],
+                        f"TikTok @{record['username']} 有一筆待補查內容已恢復，將繼續下載。",
+                        self.target_recipients(settings, record["username"]),
+                        f"repaired:{target}:{kind}:{iid}:{record['at']}",
+                    )
             except Exception as error:
                 record["failures"] += 1
                 reason = str(error)
@@ -641,6 +626,14 @@ class Catalog:
                 record["retryAt"] = self.clock() + min(
                     3600000, 30000 * 2 ** min(record["failures"], 6)
                 )
+                if not record.get("repairAlerted") and (record["failures"] >= 3 or needs_attention(error)):
+                    self.notice(
+                        record["username"],
+                        f"TikTok @{record['username']} 有一筆內容連續補查失敗，其餘內容會繼續封存。",
+                        self.target_recipients(settings, record["username"]),
+                        f"repair-error:{target}:{kind}:{iid}:{record['at']}",
+                    )
+                    record["repairAlerted"] = True
             self.db.execute(
                 "UPDATE items SET data=? WHERE target=? AND kind=? AND id=?",
                 (json.dumps(record), target, kind, iid),
@@ -652,8 +645,8 @@ class Catalog:
             try:
                 kwargs = {"headers": asset["headers"]} if asset.get("headers") else {}
                 return self.downloader(url, destination, asset["type"], **kwargs)
-            except Exception:
-                if STOP.is_set():
+            except Exception as error:
+                if STOP.is_set() or needs_attention(error):
                     raise
         raise RuntimeError("TIKTOK_MEDIA_DOWNLOAD_FAILED")
 
@@ -755,20 +748,21 @@ class Catalog:
                 for extra in record.get("extraRecipients", []):
                     self.queue_event({**record, **extra}, files)
                 record.pop("extraRecipients", None)
-                record.update(status="ready", files=files, reason=None)
-            except Exception:
+                record.update(status="ready", files=files, reason=None, failures=0, archiveAlerted=False)
+            except Exception as error:
                 record["failures"] += 1
                 record["reason"] = "TIKTOK_ARCHIVE_FAILED"
                 record["retryAt"] = self.clock() + min(
                     3600000, 30000 * 2 ** min(record["failures"], 6)
                 )
-                if record["failures"] == 1 or record["failures"] % 30 == 0:
+                if not record.get("archiveAlerted") and (record["failures"] >= 3 or needs_attention(error)):
                     self.notice(
                         record["username"],
                         f"TikTok @{record['username']} 內容下載失敗，原進度已保留，將持續重試。",
                         self.target_recipients(settings, record["username"]),
                         f'archive:{target}:{kind}:{iid}:{record["failures"]}',
                     )
+                    record["archiveAlerted"] = True
             self.db.execute(
                 "UPDATE items SET data=? WHERE target=? AND kind=? AND id=?",
                 (json.dumps(record), target, kind, iid),
@@ -793,6 +787,11 @@ class Catalog:
                 k: stream.get(k)
                 for k in ("phase", "failures", "reason", "baseline", "lastSuccess")
             }
+            report = targets[name][kind]
+            report["consecutiveFailures"] = stream["failures"]
+            if not stream.get("alerted") and stream["failures"] < 3:
+                report["failures"] = 0
+                report["reason"] = None
         pending = unresolved = 0
         for (data,) in self.db.execute("SELECT data FROM items"):
             record = json.loads(data)

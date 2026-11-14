@@ -1,4 +1,5 @@
 import json
+import errno
 from pathlib import Path
 import sys
 import tempfile
@@ -70,6 +71,90 @@ class CatalogTests(unittest.TestCase):
             lambda: self.time,
         )
         self.addCleanup(self.catalog.db.close)
+
+    def notices(self):
+        return [json.loads(data) for (data,) in self.catalog.db.execute("SELECT data FROM outbox")
+                if json.loads(data).get("kind") == "notice"]
+
+    def test_transient_poll_notifies_only_third_failure_and_recovery(self):
+        self.fetch.side_effect = RuntimeError("TIKTOK_PROVIDER_TIMEOUT")
+        for attempt in range(1, 5):
+            self.catalog.poll("alice", "post", self.settings)
+            state = self.catalog.stream("alice", "post")
+            self.catalog.health()
+            health = json.loads((self.catalog.folder / "health.json").read_text())
+            self.assertEqual(bool(health["targets"]["alice"]["post"]["failures"]), attempt >= 3)
+            self.assertEqual(len(self.notices()), int(attempt >= 3))
+            self.time = state["nextAt"]
+        self.fetch.side_effect = None
+        self.fetch.return_value = self.page()
+        self.catalog.poll("alice", "post", self.settings)
+        self.assertEqual(len(self.notices()), 2)
+
+    def test_two_transient_poll_failures_recover_silently_and_reset(self):
+        self.fetch.side_effect = RuntimeError("TIKTOK_PROVIDER_TIMEOUT")
+        for _ in range(2):
+            self.catalog.poll("alice", "post", self.settings)
+            self.time = self.catalog.stream("alice", "post")["nextAt"]
+        self.fetch.side_effect = None
+        self.fetch.return_value = self.page()
+        self.catalog.poll("alice", "post", self.settings)
+        self.assertEqual(self.notices(), [])
+        self.time = self.catalog.stream("alice", "post")["nextAt"]
+        self.fetch.side_effect = RuntimeError("TIKTOK_PROVIDER_TIMEOUT")
+        self.catalog.poll("alice", "post", self.settings)
+        self.assertEqual(self.notices(), [])
+
+    def test_archive_waits_three_failures_before_notifying(self):
+        self.fetch.return_value = self.page()
+        self.catalog.poll("alice", "post", self.settings)
+        self.download.side_effect = TimeoutError()
+        for attempt in range(1, 5):
+            self.catalog.drain(self.settings)
+            self.assertEqual(len(self.notices()), int(attempt >= 3))
+            self.time = self.records()[0]["retryAt"]
+
+    def test_captcha_still_alerts_immediately(self):
+        self.fetch.side_effect = RuntimeError("TIKTOK_CAPTCHA_REQUIRED")
+        self.catalog.poll("alice", "post", self.settings)
+        self.assertEqual(len(self.notices()), 1)
+        self.catalog.health()
+        health = json.loads((self.catalog.folder / "health.json").read_text())
+        self.assertEqual(health["targets"]["alice"]["post"]["failures"], 1)
+
+    def test_real_download_disk_full_is_not_masked_as_a_transient_network_error(self):
+        self.fetch.return_value = self.page()
+        self.catalog.poll("alice", "post", self.settings)
+        self.download.side_effect = OSError(errno.ENOSPC, "disk full")
+        self.catalog.drain(self.settings)
+        self.assertEqual(len(self.notices()), 1)
+        self.assertTrue(self.records()[0]["archiveAlerted"])
+
+    def test_unresolved_content_waits_three_repairs_and_recovers_only_after_alert(self):
+        self.fetch.return_value = self.page("repost", rows=[self.unresolved()])
+        self.catalog.poll("alice", "repost", self.settings)
+        self.assertEqual(self.notices(), [])
+        self.fetch.side_effect = RuntimeError("TIKTOK_ITEM_UNAVAILABLE")
+        for attempt in range(1, 5):
+            self.catalog.repair(self.settings)
+            self.assertEqual(len(self.notices()), int(attempt >= 3))
+            self.time = self.records()[0]["retryAt"]
+        self.fetch.side_effect = None
+        self.fetch.return_value = {"items": [self.row("2")]}
+        self.catalog.repair(self.settings)
+        self.assertEqual(len(self.notices()), 2)
+
+    def test_pending_poll_failure_count_survives_reopening_database(self):
+        self.fetch.side_effect = RuntimeError("TIKTOK_PROVIDER_TIMEOUT")
+        for _ in range(2):
+            self.catalog.poll("alice", "post", self.settings)
+            self.time = self.catalog.stream("alice", "post")["nextAt"]
+        restarted = Catalog(self.catalog.root, self.catalog.state_dir, self.catalog.control,
+                            self.fetch, self.download, lambda: self.time)
+        self.addCleanup(restarted.db.close)
+        restarted.poll("alice", "post", self.settings)
+        self.assertEqual(restarted.stream("alice", "post")["failures"], 3)
+        self.assertEqual(len(self.notices()), 1)
 
     def row(self, iid="1", caption="caption"):
         return {

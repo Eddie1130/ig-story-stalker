@@ -1,4 +1,5 @@
 import { telegramApiBase } from './telegram-endpoint.mjs';
+import { recoverableIssue } from './error-monitor.mjs';
 import { ManualJobs } from './manual-jobs.mjs';
 import { controlEnabled, readSettings, settingsFile, targetConfigs } from './telegram-settings.mjs';
 import { notificationPublisher } from './telegram-events.mjs';
@@ -76,10 +77,10 @@ export async function main({ env = process.env, args = process.argv, dir = '/app
   }
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, stop);
   const manualJobs = managed ? new ManualJobs({ root: env.IG_ARCHIVE_DIR || '/downloads', stateDir: dir, settings: () => readSettings(settingsFile(env)), control, env, log: emit, fetcher: manualFetcher, downloader: manualDownloader }) : null;
-  const makeEntry = config => ({ config, watcher: null, failures: 0, nextFetchAt: 0, nextCycleAt: 0, retryAt: 0, error: null,
+  const makeEntry = config => ({ config, watcher: null, failures: 0, runtimeFailures: 0, runtimeCritical: false, nextFetchAt: 0, nextCycleAt: 0, retryAt: 0, error: null,
     status() {
       const status = this.watcher ? { ...this.watcher.status(), username: this.config.username } : { target: this.target, username: this.config.username, failures: this.failures, nextFetchAt: this.nextFetchAt, telegramOk: true, archiveOk: true, catalogOk: true };
-      return this.error ? { ...status, failures: Math.max(3, status.failures), nextFetchAt: this.retryAt } : status;
+      return this.error ? { ...status, failures: Math.max(this.runtimeCritical ? 3 : this.runtimeFailures, status.failures), nextFetchAt: this.retryAt } : status;
     },
   });
   let entries = configs.map(makeEntry);
@@ -180,16 +181,18 @@ export async function main({ env = process.env, args = process.argv, dir = '/app
           }
           const cycle = await entry.watcher.cycle();
           emit('WATCH_TARGET_COMPLETED', { target, username: config.username, usernames: group.map(e => e.config.username) });
-          entry.error = null; entry.retryAt = 0;
+          entry.error = null; entry.retryAt = 0; entry.runtimeFailures = 0; entry.runtimeCritical = false;
           entry.nextCycleAt = cycle?.yielded ? 0 : Date.now() + Math.max(1000, Math.min(interval * 1000, entry.watcher.status().nextFetchAt - Date.now()));
         } catch (error) {
           if (error.message === 'SHARED_SESSION_INVALID') { sessionBlocked = { ...config, probeAt: Date.now() + 300000 }; emit('SHARED_SESSION_INVALID'); break; }
           // Preserve the in-memory queue after a failed write. Only this account pauses.
           entry.error = error.code || (/^[A-Z0-9_]+$/.test(error.message) ? error.message : 'TARGET_RUNTIME_ERROR');
+          entry.runtimeFailures++;
+          entry.runtimeCritical = !recoverableIssue('target-runtime', entry.error);
           entry.retryAt = Date.now() + 300000;
           emit('WATCH_TARGET_FAILED', { target, username: config.username, usernames: group.map(e => e.config.username), reason: entry.error });
         }
-        for (const alias of group) { alias.watcher = entry.watcher; alias.error = entry.error; alias.retryAt = entry.retryAt; alias.nextCycleAt = entry.nextCycleAt; }
+        for (const alias of group) { alias.watcher = entry.watcher; alias.error = entry.error; alias.runtimeFailures = entry.runtimeFailures; alias.runtimeCritical = entry.runtimeCritical; alias.retryAt = entry.retryAt; alias.nextCycleAt = entry.nextCycleAt; }
         health();
         if (entries.length > 1 && entry !== entries.at(-1) && !stopping) {
           emit('WATCH_TARGET_PAUSE', { seconds: 2 }); await sleep(2000);
@@ -198,7 +201,7 @@ export async function main({ env = process.env, args = process.argv, dir = '/app
       await notifySession();
       if (!managed && env.IG_EXTERNAL_ERROR_MONITOR !== '1') {
         for (const entry of entries) {
-          const reason = entry.error || (entry.failures >= 3 ? 'TARGET_LOOKUP_FAILED' : null);
+          const reason = (entry.runtimeCritical || entry.runtimeFailures >= 3 ? entry.error : null) || (entry.failures >= 3 ? 'TARGET_LOOKUP_FAILED' : null);
           if (reason === (entry.notifiedReason || null)) continue;
           try {
             await telegram('sendMessage', { text: reason

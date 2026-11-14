@@ -269,7 +269,7 @@ test('alias account error/recovery metadata and summaries include both subscript
   s.users['200'].targets.alice = subscription(1000);
   const outbox = path.join(f.state, 'monitor/outbox');
   const issues = new Issues(path.join(f.state, 'monitor/issues.json'), outbox, 'all');
-  issues.fail('target:alice:fetch', 'FETCH_TIMEOUT', '@alice', { target: '101', usernames: ['101', 'alice'] });
+  for(let i=0;i<3;i++)issues.fail('target:alice:fetch', 'FETCH_TIMEOUT', '@alice', { target: '101', usernames: ['101', 'alice'] });
   issues.fail('target:bob:fetch', 'BOB_PRIVATE_ERROR', '@bob', { target: '202', usernames: ['bob'] });
   atomic(path.join(f.state, 'health.json'), { at: Date.now(), targets: [{ username: '101', target: '101', failures: 1 }, { username: 'alice', target: '101', failures: 1 }] });
   const summary = describeUser(s, '100', f.state);
@@ -367,8 +367,10 @@ test('removed-account incidents are suspended and aliases migrate one target sco
   const { Issues } = await import('../src/error-monitor.mjs');
   const f = fixture(t), file = path.join(f.dir, 'scopes.json');
   const issues = new Issues(file, path.join(f.dir, 'scope-outbox'), 'all');
-  issues.fail('target:101:fetch', 'FETCH_TIMEOUT', '@101', { target: '101', usernames: ['101'] });
-  issues.fail('target:bob:fetch', 'FETCH_TIMEOUT', '@bob', { target: '202', usernames: ['bob'] });
+  for(let i=0;i<3;i++) {
+    issues.fail('target:101:fetch', 'FETCH_TIMEOUT', '@101', { target: '101', usernames: ['101'] });
+    issues.fail('target:bob:fetch', 'FETCH_TIMEOUT', '@bob', { target: '202', usernames: ['bob'] });
+  }
   issues.migrateTarget('101', 'alice');
   assert.equal(Object.hasOwn(issues.state, 'target:101:fetch'), false);
   assert.equal(issues.state['target:alice:fetch'].active, true);

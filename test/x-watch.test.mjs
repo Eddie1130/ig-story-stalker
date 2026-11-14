@@ -30,8 +30,9 @@ test('first snapshots and new subscribers are quiet; subsequent discoveries noti
   const restarted=new XWatcher({...f,settings:()=>f.settings});await restarted.cycle(184000);
   assert.equal(events(f).filter(e=>e.type==='post').length,2);
 });
-test('fetch failures preserve baseline, recover with a durable quiet gap backfill, and do not block manual work',async t=>{
+test('sustained fetch failures preserve baseline and recover with a durable quiet gap backfill',async t=>{
   const f=fixture(t);await f.watcher.cycle(1700000000000);f.fail(true);await f.watcher.cycle(1700000061000);
+  await f.watcher.cycle(1700000121000);await f.watcher.cycle(1700000181000);
   assert.ok(f.watcher.state.accounts.alice.gapStart);
   f.fail(false);f.set([post('2')]);await f.watcher.cycle(1700004000000);
   assert.ok(Object.values(f.watcher.state.history).some(j=>j.username==='alice'&&j.gap));
@@ -101,6 +102,7 @@ test('missing start date is actionable and failed history retries without losing
   f.watcher.historyRunner=async()=>{throw Error('X_NO_ACCOUNT_AVAILABLE');};
   f.watcher.startNextHistory(2000);await f.watcher.historyTask;
   assert.equal(retry.status,'retry');assert.equal(retry.attempts,0,'pool rate locks do not consume the failure budget');
+  assert.equal(events(f).filter(e=>/歷史回補暫停/.test(e.text||'')).length,0);
 });
 test('container downtime schedules quiet gap catch-up even without a recorded fetch error',async t=>{
   const f=fixture(t);await f.watcher.cycle(1700000000000);f.set([post('2')]);
@@ -248,4 +250,121 @@ test('a tolerated 404 does not hide a later downtime gap',async t=>{
   f.watcher.fetchImpl=f.fetchImpl;
   await f.watcher.pollAccount('alice',1700100000000);
   assert.ok(Object.values(f.watcher.state.history).some(j=>j.gap));
+});
+
+for(const status of [500,502,503,429,'network'])test(`${status} waits for three consecutive failures across restarts`,async t=>{
+  const f=fixture(t);await f.watcher.pollAccount('alice',1000);
+  const fail=async()=>{if(status==='network')throw Error('offline');return new Response('{}',{status});};
+  f.watcher.fetchImpl=fail;
+  await f.watcher.pollAccount('alice',61000);await f.watcher.pollAccount('alice',121000);
+  assert.equal(f.watcher.account('alice').failures,0);assert.equal(events(f).length,0);
+  const restarted=new XWatcher({...f,settings:()=>f.settings,fetchImpl:fail});
+  await restarted.pollAccount('alice',181000);
+  assert.equal(restarted.account('alice').failures,1);assert.equal(events(f).filter(e=>/監控異常/.test(e.text)).length,1);
+});
+test('short transient failures recover silently and reset the streak',async t=>{
+  const f=fixture(t);await f.watcher.pollAccount('alice',1000);
+  f.watcher.fetchImpl=async()=>new Response('{}',{status:500});
+  await f.watcher.pollAccount('alice',61000);await f.watcher.pollAccount('alice',121000);
+  f.watcher.fetchImpl=f.fetchImpl;await f.watcher.pollAccount('alice',181000);
+  assert.equal(events(f).length,0);assert.equal(Object.keys(f.watcher.state.history).length,0);
+  f.watcher.fetchImpl=async()=>new Response('{}',{status:500});await f.watcher.pollAccount('alice',241000);
+  assert.equal(f.watcher.account('alice').failures,0);
+});
+test('history transient failures retry quietly six times and notify only at exhaustion',async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  const job=f.watcher.enqueueHistory({username:'alice',userId:'100'},1000);
+  f.watcher.historyRunner=async()=>{throw Error('X_NETWORK_ERROR');};
+  for(let i=1;i<=6;i++){
+    f.watcher.startNextHistory(i===1?1000:job.retryAt);await f.watcher.historyTask;
+    assert.equal(job.status,i<6?'retry':'failed');
+    assert.equal(events(f).filter(e=>/歷史回補(?:暫停|失敗)/.test(e.text)).length,i<6?0:1);
+  }
+});
+test('archive transient failures wait three attempts and share one alert per target',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  for(const id of ['2','3'])a.pending[`post:${id}`]={event:{statusId:id},at:1,recipients:[]};
+  f.archive.save=async()=>{throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');};
+  for(let i=0;i<3;i++){
+    await f.watcher.archivePending(1000+i*300000);
+    assert.equal(events(f).filter(e=>/封存失敗/.test(e.text)).length,i<2?0:1);
+  }
+  f.archive.save=async()=>({errors:[]});await f.watcher.archivePending(901000);
+  assert.equal(events(f).filter(e=>/封存已恢復/.test(e.text)).length,1);
+});
+test('temporary pool read errors do not notify before three failed checks',async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  f.watcher.child=async()=>{throw Error('X_HISTORY_PROCESS_FAILED');};
+  await f.watcher.refreshPool(1000);await f.watcher.refreshPool(31000);
+  assert.equal(events(f).length,0);
+  await f.watcher.refreshPool(61000);assert.equal(events(f).length,1);
+});
+
+test('alternating recoverable errors share a consecutive failure streak',async t=>{
+  const f=fixture(t);await f.watcher.pollAccount('alice',1000);
+  for(const [i,status] of [404,500,502].entries()){
+    f.watcher.fetchImpl=async()=>new Response('{}',{status});await f.watcher.pollAccount('alice',61000+i*60000);
+    assert.equal(f.watcher.account('alice').failures,i<2?0:1);
+  }
+  assert.equal(events(f).filter(e=>/監控異常/.test(e.text)).length,1);
+});
+test('manual transient errors get six attempts and keep the requester informed only at exhaustion',async t=>{
+  const f=fixture(t),id='200-8-0';
+  f.settings.xRequests[id]={id,userId:'200',type:'manual',username:'alice',url:'https://x.com/alice/status/8',at:100};
+  f.watcher.fetchImpl=async()=>new Response('{}',{status:500});f.watcher.syncRequests(1000);
+  for(let i=1;i<=6;i++){
+    await f.watcher.manualRequests(1000+(i-1)*30000);
+    assert.equal(f.watcher.state.requests[id].status,i<6?'retry':'failed');
+    assert.equal(events(f).length,i<6?0:1);
+  }
+  assert.deepEqual(events(f)[0].recipients,[{userId:'200'}]);
+});
+test('persistent empty pools alert once and send one recovery',async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  f.watcher.child=async()=>JSON.stringify({active:0,locked:0});
+  for(let i=0;i<4;i++){
+    await f.watcher.refreshPool(1000+i*30000);assert.equal(events(f).length,i<2?0:1);
+  }
+  f.watcher.child=async()=>JSON.stringify({active:1,locked:0});
+  await f.watcher.refreshPool(121000);await f.watcher.refreshPool(151000);
+  assert.equal(events(f).length,2);
+});
+test('automatic gap backfill start and success are silent',async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  const job=f.watcher.enqueueHistory({username:'alice',userId:'100',gap:true},1000);
+  f.watcher.historyRunner=async(_job,{out})=>{
+    fs.writeFileSync(path.join(out,'alice_posts.jsonl'),'');return {status:'complete'};
+  };
+  f.watcher.child=async()=>{};
+  f.watcher.startNextHistory(1000);await f.watcher.historyTask;await f.watcher.finishHistories();
+  assert.equal(job.reported,true);assert.equal(events(f).length,0);
+});
+test('disk full still alerts immediately while downloads remain queued',async t=>{
+  const f=fixture(t),a=f.watcher.account('alice');
+  a.pending['post:2']={event:{statusId:'2'},at:1,recipients:[]};
+  f.archive.save=async()=>{throw Error('ENOSPC');};await f.watcher.archivePending(1000);
+  assert.equal(events(f).length,1);assert.equal(a.pending['post:2'].failed,true);
+});
+
+for(const gapFirst of [true,false])test(`explicit history merged with gap retains completion notice (gapFirst=${gapFirst})`,async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  const background={username:'alice',userId:'100',gap:true};
+  const explicit={username:'alice',userId:'100',requestId:'100-1-0'};
+  const job=f.watcher.enqueueHistory(gapFirst?background:explicit,1000);
+  assert.equal(f.watcher.enqueueHistory(gapFirst?explicit:background,1000),job);
+  f.watcher.historyRunner=async(_job,{out})=>{fs.writeFileSync(path.join(out,'alice_posts.jsonl'),'');return {status:'complete'};};
+  f.watcher.child=async()=>{};
+  f.watcher.startNextHistory(1000);await f.watcher.historyTask;await f.watcher.finishHistories();
+  assert.equal(events(f).filter(e=>/歷史回補已開始/.test(e.text)).length,1);
+  assert.equal(events(f).filter(e=>/搜尋流程已完成/.test(e.text)).length,1);
+});
+test('real history worker timeout responses get six quiet attempts',async t=>{
+  const f=fixture(t);f.watcher.env={...f.env,X_HISTORY_ENABLED:'1'};
+  const job=f.watcher.enqueueHistory({username:'alice',userId:'100'},1000);
+  f.watcher.historyRunner=async()=>({status:'failed',reason:'X_HISTORY_TIMEOUT'});
+  for(let i=1;i<=6;i++){
+    f.watcher.startNextHistory(i===1?1000:job.retryAt);await f.watcher.historyTask;
+    assert.equal(job.status,i<6?'retry':'failed');
+    assert.equal(events(f).filter(e=>/歷史回補失敗/.test(e.text)).length,i<6?0:1);
+  }
 });

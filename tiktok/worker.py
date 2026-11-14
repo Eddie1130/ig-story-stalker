@@ -1,5 +1,6 @@
 """Telegram-controlled TikTok recording using the imported recorder/API implementation."""
 import hashlib
+import errno
 import json
 import logging
 import os
@@ -23,6 +24,20 @@ PROCESSING = queue.Queue()
 PROCESS_STOP = threading.Event()
 STATUS = {}
 STATUS_LOCK = threading.Lock()
+
+
+def needs_attention(error):
+    """Local storage, authentication and unsafe state cannot heal by retrying."""
+    return (
+        isinstance(error, OSError) and error.errno in {
+            errno.ENOSPC, errno.EDQUOT, errno.EACCES, errno.EPERM, errno.EROFS,
+            errno.EIO, errno.ENOENT, errno.ENOTDIR,
+        }
+        or bool(re.search(
+            r'CAPTCHA_REQUIRED|LOGIN_REQUIRED|COOKIE_.*INVALID|SETTINGS_INVALID|'
+            r'UNSAFE|HISTORY_.*(?:MISSING|INVALID)|IDENTITY_INVALID', str(error)
+        ))
+    )
 
 
 def atomic(file, value):
@@ -122,13 +137,19 @@ def processing():
             job = json.loads(file.read_text())
             finalize(job)
             file.unlink()
-        except Exception:
-            status(job['username'] if job else 'worker', '轉檔／分段失敗，已保留待重試')
+        except Exception as error:
             if job:
                 try:
-                    emit(job['username'], 'notice', 'TikTok 轉檔／分段失敗，原檔已保留；稍後重試。', job['recipients'], identity='processing-error:' + file.name)
+                    job['failures'] = job.get('failures', 0) + 1
+                    status(job['username'], '轉檔／分段失敗，已保留待重試' if job['failures'] >= 3 or needs_attention(error) else f"轉檔重試中（{job['failures']}/3）")
+                    if not job.get('alerted') and (job['failures'] >= 3 or needs_attention(error)):
+                        emit(job['username'], 'notice', 'TikTok 轉檔／分段失敗，原檔已保留；稍後重試。', job['recipients'], identity='processing-error:' + file.name)
+                        job['alerted'] = True
+                    atomic(file, job)
                 except Exception:
                     status('processor', '無法寫入錯誤事件，請檢查磁碟')
+            else:
+                status('processor', '轉檔工作紀錄讀取失敗，請檢查本機紀錄')
             STOP.wait(30)
             if not STOP.is_set():
                 PROCESSING.put(file)
@@ -182,7 +203,10 @@ def record_account(name, cookie_map):
                              ffmpeg_path='ffmpeg', use_telegram=False)
     rec = Recorder(config)
     failures = 0
+    alerted = False
+    recipients = []
     while not STOP.is_set():
+        urgent = False
         try:
             recipients = subscriptions(settings()).get(name, [])
             if not recipients:
@@ -202,22 +226,30 @@ def record_account(name, cookie_map):
                 rec._recording_bytes = rec._stream_retry_failures = 0
                 rec._recording_phase = 'starting'
                 rec.start_recording(name, room)
-            if failures >= 3:
+            if alerted:
                 emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients)
+                alerted = False
             failures = 0
             status(name, '監看中')
         except (UserLiveError, LiveNotFound) as error:
             if str(TikTokError.USER_NOT_CURRENTLY_LIVE) in str(error):
+                if alerted:
+                    emit(name, 'notice', f'TikTok @{name} 監控已恢復。', recipients)
+                    alerted = False
                 failures = 0
                 status(name, '未開播')
             else:
                 failures += 1
-        except Exception:
+                urgent = needs_attention(error)
+        except Exception as error:
             failures += 1
+            urgent = needs_attention(error)
         if failures:
-            status(name, '檢查／錄影異常，重試中')
-            if failures == 3 or failures % 30 == 0:
+            abnormal = alerted or failures >= 3 or urgent
+            status(name, '檢查／錄影異常，重試中' if abnormal else f'等待重試（{failures}/3）')
+            if abnormal and not alerted:
                 emit(name, 'notice', f'TikTok @{name} 監控／錄影失敗，將持續重試。', recipients)
+                alerted = True
         STOP.wait(60)
     status(name, '已停止監控')
 

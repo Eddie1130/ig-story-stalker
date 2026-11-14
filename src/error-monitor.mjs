@@ -23,6 +23,13 @@ export function queue(dir, kind, text, extra = {}) {
   atomic(path.join(dir, id + '.json'), { id, at: Date.now(), kind, text, ...extra });
   return id;
 }
+export function recoverableIssue(key, reason) {
+  // Authentication, state integrity and local storage require operator action.
+  if (/SESSION_INVALID|RELOGIN|UNTRUSTED|CRITICAL_|GUARD_INVARIANT|HISTORY_|INVALID_MEDIA_STATE|MEDIA_STATE_|INVALID_PENDING_MEDIA|SETTINGS_INVALID|INVALID_CONFIG|NAS_INVALID_|CATALOG_INVALID_(HISTORY|PATH|CONFIG)|ENOSPC|EDQUOT|EACCES|EPERM|EROFS|ENOTDIR|NAS_ENOENT|NAS_EIO|(?:HTTP_|http=|TELEGRAM_(?:ERROR_|HTTP_)?)(401|403)(?:$|:)/.test(reason)) return false;
+  const operation = key.replace(/^target:[^:]+:/, '');
+  if (operation === 'target-runtime' && reason !== 'TARGET_RUNTIME_ERROR' && !/NETWORK|TIMEOUT|ECONN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH/.test(reason)) return false;
+  return /^(fetch|target-runtime|skipped-media|missing-media:.*|media:.*|archive:.*|catalog-(fetch|archive|telegram|caption):.*|worker-telegram)$/.test(operation);
+}
 export class Issues {
   constructor(file, outbox, target) {
     this.file = file; this.outbox = outbox; this.target = target;
@@ -31,16 +38,21 @@ export class Issues {
     for (const entry of Object.values(this.state)) if (!entry || typeof entry.active !== 'boolean') throw Error('INVALID_ISSUE_ENTRY');
   }
   fail(key, reason, label = this.target, scope = {}) {
+    if (reason === 'TELEGRAM_RETRY_WAIT') return; // Waiting for a saved cooldown is not another attempt.
     const old = this.state[key];
-    if (!old?.active || old.reason !== safe(reason)) queue(this.outbox, 'error', `IG 監控異常：${label}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`, { issueKey: key, reason: safe(reason), username: /^target:([^:]+):/.exec(key)?.[1], target: /^\d+$/.test(scope.target || '') ? scope.target : undefined, usernames: scope.usernames });
-    this.state[key] = { active: true, label, target: scope.target, usernames: scope.usernames, reason: safe(reason), firstAt: old?.active ? old.firstAt : Date.now(), lastAt: Date.now(), count: (old?.count || 0) + 1 };
+    const retry = recoverableIssue(key, reason);
+    const continuing = old?.active || old?.pending;
+    const count = continuing ? (old.count || 0) + 1 : 1;
+    const active = !!old?.active || !retry || count >= 3;
+    if (active && (!old?.active || (!retry && old.reason !== safe(reason)))) queue(this.outbox, 'error', `IG 監控異常：${label}\n${safe(key)}\n${safe(reason)}\n時間：${formatJST()}`, { issueKey: key, reason: safe(reason), username: /^target:([^:]+):/.exec(key)?.[1], target: /^\d+$/.test(scope.target || '') ? scope.target : undefined, usernames: scope.usernames });
+    this.state[key] = { active, pending: !active, label, target: scope.target, usernames: scope.usernames, reason: safe(reason), firstAt: continuing ? old.firstAt : Date.now(), lastAt: Date.now(), count };
     atomic(this.file, this.state);
   }
   resolve(key) {
     const old = this.state[key];
-    if (!old?.active) return;
-    queue(this.outbox, 'recovery', `IG 監控異常已解除：${old.label || this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`, { issueKey: key, reason: old.reason, username: /^target:([^:]+):/.exec(key)?.[1], target: old.target, usernames: old.usernames });
-    this.state[key] = { ...old, active: false, resolvedAt: Date.now() };
+    if (!old?.active && !old?.pending) return;
+    if (old.active) queue(this.outbox, 'recovery', `IG 監控異常已解除：${old.label || this.target}\n${safe(key)}\n先前：${old.reason}\n時間：${formatJST()}`, { issueKey: key, reason: old.reason, username: /^target:([^:]+):/.exec(key)?.[1], target: old.target, usernames: old.usernames });
+    this.state[key] = { ...old, active: false, pending: false, count: 0, resolvedAt: Date.now() };
     atomic(this.file, this.state);
   }
   migrateAccount(username) {
@@ -58,8 +70,8 @@ export class Issues {
   suspendAccount(username, target) {
     let changed = false;
     for (const [key, issue] of Object.entries(this.state)) {
-      if (issue.active && key.startsWith('target:') && (key.startsWith(`target:${username}:`) || (target && issue.target === target))) {
-        this.state[key] = { ...issue, active: false, suspended: true, resolvedAt: Date.now() }; changed = true;
+      if ((issue.active || issue.pending) && key.startsWith('target:') && (key.startsWith(`target:${username}:`) || (target && issue.target === target))) {
+        this.state[key] = { ...issue, active: false, pending: false, count: 0, suspended: true, resolvedAt: Date.now() }; changed = true;
       }
     }
     if (changed) atomic(this.file, this.state);

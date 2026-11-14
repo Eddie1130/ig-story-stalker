@@ -28,7 +28,7 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
     const catalog = target?.target && /^\d+$/.test(target.target) ? read(path.join(stateDir, `catalog-${target.target}.json`), null) : null;
     const assets = Object.values(catalog?.assets || {});
     const pending = assets.filter(a => !a?.archiveDone).length;
-    lines.push(`@${name}：${!target ? '等待解析帳號' : target.failures ? '檢查異常／重試中' : '監看中'}；貼文／精選已下載 ${assets.length - pending}，待下載 ${pending}`);
+    lines.push(`@${name}：${!target ? '等待解析帳號' : target.failures >= 3 ? '檢查異常／重試中' : target.failures ? `等待重試（${target.failures}/3）` : '監看中'}；貼文／精選已下載 ${assets.length - pending}，待下載 ${pending}`);
   }
   const xNames = Object.keys(user?.xTargets || {});
   if (xNames.length) {

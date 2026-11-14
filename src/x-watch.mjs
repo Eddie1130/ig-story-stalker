@@ -15,6 +15,7 @@ const nextDay = now => new Date(now + 86400000).toISOString().slice(0,10);
 const day = now => new Date(now).toISOString().slice(0,10);
 const active = status => ['queued','working','importing','retry'].includes(status);
 const safeReason = error => /^[A-Z][A-Z0-9_]{1,90}$/.test(error?.message || '') ? error.message : 'X_OPERATION_FAILED';
+const recoverable = reason => /^(X_HTTP_(404|408|429|5\d\d)|X_NETWORK_ERROR|X_MEDIA_DOWNLOAD_INCOMPLETE|X_HISTORY_PROCESS_FAILED|X_HISTORY_TIMEOUT)$/.test(reason);
 const pythonScript = name => fileURLToPath(new URL('../' + name, import.meta.url));
 
 // Every mutable queue has one writer: this process. Telegram owns settings.json.
@@ -138,7 +139,7 @@ export class XWatcher {
   async pollAccount(name,now) {
     const a=this.account(name);if(now<a.nextAt)return;
     // A stopped container cannot record fetch errors. Infer a gap from its checkpoint.
-    if(a.baseline&&a.lastSuccess&&(!a.consecutive404||now>a.nextAt+this.interval*2)&&now-a.lastSuccess>this.interval*2)a.gapStart ||= a.lastSuccess;
+    if(a.baseline&&a.lastSuccess&&(!(a.consecutiveTransient||a.consecutive404)||now>a.nextAt+this.interval*2)&&now-a.lastSuccess>this.interval*2)a.gapStart ||= a.lastSuccess;
     const subscribers=this.subscriptions(name);
     try {
       const payload=await this.json(`https://api.fxtwitter.com/2/profile/${name}/statuses?count=100&with_replies=1`);
@@ -156,16 +157,18 @@ export class XWatcher {
       if(a.gapStart) {
         const job=this.enqueueHistory({username:name,start:day(a.gapStart),end:nextDay(now),gap:true},now);
         job.userIds=[...new Set([...job.userIds,...subscribers.map(s=>s.userId)])];
-        this.notice(`X @${name} 監控已恢復；中斷期間已排入歷史補抓，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
+        if(a.failures>0)this.notice(`X @${name} 監控已恢復；中斷期間已排入歷史補抓，不逐篇補發通知。`,name,`${name}:recovery:${a.gapStart}`);
         delete a.gapStart;
       }
-      a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;a.consecutive404=0;delete a.reason;
+      a.baseline=true;a.lastSuccess=now;a.nextAt=now+this.interval;a.failures=0;a.consecutive404=0;a.consecutiveTransient=0;delete a.reason;
       this.persist();
     } catch(error) {
       if(error.code)throw error;
       const fetchReason=safeReason(error);
+      // Fall back to the saved 404 streak when upgrading existing worker state.
+      a.consecutiveTransient=recoverable(fetchReason)?(a.consecutiveTransient??a.consecutive404??0)+1:0;
       a.consecutive404=fetchReason==='X_HTTP_404'?(a.consecutive404||0)+1:0;
-      if(fetchReason==='X_HTTP_404'&&a.consecutive404<3&&a.failures===0) {
+      if(recoverable(fetchReason)&&a.consecutiveTransient<3&&a.failures===0) {
         a.nextAt=now+this.interval;
         this.persist();return;
       }
@@ -188,11 +191,16 @@ export class XWatcher {
           if(result.errors?.length) throw Error('X_MEDIA_DOWNLOAD_INCOMPLETE');
           if(p.recipients.length)this.emit({type:'post',username:name,kind:p.event.kind,statusId:p.event.statusId,publishedAt:p.event.publishedAt,at:p.at,recipients:p.recipients,result},`${name}:${key}:${p.at}`);
           delete a.pending[key];
-          if(p.failed)this.notice(`X @${name} 貼文 ${p.event.statusId} 封存已恢復。`,name,`${name}:archive-recovery:${key}`);
         } catch(error) {
+          p.attempts=(p.attempts||0)+1;p.reason=safeReason(error);
           p.retryAt=now+300000;
-          if(!p.failed)this.notice(`X @${name} 封存失敗：${safeReason(error)}。內容仍在佇列等待重試。`,name,`${name}:archive:${key}`);
-          p.failed=true;
+          if(p.attempts>=3||['ENOSPC','EACCES','EROFS','X_UNSAFE_PATH'].includes(p.reason)) {
+            if(!a.archiveWarned)this.notice(`X @${name} 封存失敗：${p.reason}。內容仍在佇列等待重試。`,name,`${name}:archive:${key}:${now}`);
+            a.archiveWarned=true;p.failed=true;
+          }
+        }
+        if(a.archiveWarned&&!Object.values(a.pending).some(item=>item.failed)) {
+          this.notice(`X @${name} 封存已恢復。`,name,`${name}:archive-recovery:${now}`);a.archiveWarned=false;
         }
         this.persist();
     }
@@ -235,7 +243,7 @@ export class XWatcher {
         task.status='complete';task.manualArchiveVersion=1;
       } catch(error) {
         task.attempts++;task.reason=safeReason(error);task.retryAt=now+30000;
-        task.status=task.attempts>=3?'failed':'retry';
+        task.status=task.attempts>=(recoverable(task.reason)?6:3)?'failed':'retry';
         if(task.status==='failed')this.notice(`X 連結下載失敗：${task.reason}\n${r.url}`,null,`manual-failed:${r.id}`,[r.userId]);
       }
       atomic(path.join(this.dir,'jobs',r.id+'.json'),{...task,requestId:r.id,username:r.username,at:now});
@@ -326,7 +334,10 @@ export class XWatcher {
       this.persist();this.writeJob(job);return;
     }
     job.status='working';job.attempts++;this.persist();this.writeJob(job);
-    this.notice(`X @${job.username} 歷史回補已開始，可從帳號選單查看進度。`,job.username,`${job.id}:started`,job.userIds);
+    if((!job.gap||job.requestIds.length)&&!job.startedNotified) {
+      this.notice(`X @${job.username} 歷史回補已開始，可從帳號選單查看進度。`,job.username,`${job.id}:started`,job.userIds);
+      job.startedNotified=true;
+    }
     this.historyTask=(async()=>{
       try {
         const result=await this.runHistory(job);
@@ -347,12 +358,12 @@ export class XWatcher {
       } catch(error) {
         if(job.cancelRequested||error.message==='X_HISTORY_CANCELLED') {job.status='cancelled';return;}
         if(this.stopping) {job.status='queued';job.attempts--;job.retryAt=0;return;}
-        const previous=job.reason;job.reason=safeReason(error);
+        job.reason=safeReason(error);
         // Rate locks/session refresh are waiting states, not exhausted scraping attempts.
         if(job.reason==='X_NO_ACCOUNT_AVAILABLE') {job.attempts--;job.status='retry';}
-        else job.status=job.attempts<3?'retry':'failed';
-        job.retryAt=Date.now()+300000;
-        if(previous!==job.reason||job.status==='failed')this.notice(`X @${job.username} 歷史回補${job.status==='retry'?'暫停，稍後續跑':'失敗'}：${job.reason}`,job.username,`${job.id}:error:${job.attempts}`,job.userIds);
+        else job.status=job.attempts<(recoverable(job.reason)?6:3)?'retry':'failed';
+        job.retryAt=Date.now()+Math.min(3600000,300000*2**Math.max(0,job.attempts-1));
+        if(job.status==='failed')this.notice(`X @${job.username} 歷史回補失敗：${job.reason}`,job.username,`${job.id}:error:${job.attempts}`,job.userIds);
       } finally {this.persist();this.writeJob(job);this.historyTask=null;}
     })();
   }
@@ -398,7 +409,7 @@ export class XWatcher {
         catch(error) {job.reason=safeReason(error);job.status='partial';}
       }
       const labels={complete:'搜尋流程已完成',partial:'部分完成，仍有未完成區段',needs_start:'無法取得建立日期，請用 /xhistory 指定起日',failed:'失敗'};
-      this.notice(`X @${job.username} 歷史回補：${labels[job.status]||job.status}；已匯入 ${job.posts||0} 篇並封存可取得的媒體。搜尋完成不代表歷史完整無缺。`,job.username,`${job.id}:result`,job.userIds);
+      if(!job.gap||job.requestIds.length||job.status!=='complete')this.notice(`X @${job.username} 歷史回補：${labels[job.status]||job.status}；已匯入 ${job.posts||0} 篇並封存可取得的媒體。搜尋完成不代表歷史完整無缺。`,job.username,`${job.id}:result`,job.userIds);
       job.reported=true;delete job.phase;this.persist();this.writeJob(job);
     }
   }
@@ -420,18 +431,21 @@ export class XWatcher {
       if(!Number.isInteger(pool.active)||!Number.isInteger(pool.locked)||pool.locked<0||pool.locked>pool.active)throw Error('X_POOL_INVALID');
       const nextAvailableAt=Number.isFinite(pool.nextAvailableAt)&&pool.nextAvailableAt>now?pool.nextAvailableAt:null;
       this.state.pool={active:pool.active,locked:pool.locked,available:pool.active-pool.locked,nextAvailableAt,checkedAt:now};
+      this.state.poolFailures=0;
+      this.state.poolEmptyChecks=pool.active?0:(this.state.poolEmptyChecks||0)+1;
       for(const job of Object.values(this.state.history)) {
         if(job.status!=='retry'||job.reason!=='X_NO_ACCOUNT_AVAILABLE')continue;
         if(this.state.pool.available>0)job.retryAt=now;
         else if(nextAvailableAt)job.retryAt=nextAvailableAt+1000;
         this.writeJob(job,now);
       }
-      if(!pool.active&&!this.state.poolWarned){this.notice('X 歷史回補沒有可用登入帳號，請管理員在主機端更新 twscrape 帳號池。');this.state.poolWarned=true;}
+      if(!pool.active&&this.state.poolEmptyChecks>=3&&!this.state.poolWarned){this.notice('X 歷史回補沒有可用登入帳號，請管理員在主機端更新 twscrape 帳號池。');this.state.poolWarned=true;}
       if(pool.active&&this.state.poolWarned){this.notice('X 歷史回補帳號池已恢復可用。');this.state.poolWarned=false;}
     } catch(error) {
       if(this.stopping)return;
       this.state.pool={active:0,locked:0,reason:safeReason(error)};
-      if(!this.state.poolWarned){this.notice('X 帳號池狀態讀取失敗，請管理員檢查 accounts.db。');this.state.poolWarned=true;}
+      this.state.poolEmptyChecks=0;this.state.poolFailures=(this.state.poolFailures||0)+1;
+      if(this.state.poolFailures>=3&&!this.state.poolWarned){this.notice('X 帳號池狀態讀取失敗，請管理員檢查 accounts.db。');this.state.poolWarned=true;}
     }
     this.state.poolNextAt=now+30000;this.persist();
   }

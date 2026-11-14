@@ -4,9 +4,11 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location('tiktok_worker', Path(__file__).resolve().parents[1] / 'tiktok/worker.py')
 w = importlib.util.module_from_spec(spec)
@@ -79,6 +81,72 @@ class TikTokWorkerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 w.finalize(job)
         self.assertTrue(source.exists())
+
+    def test_processing_waits_three_attempts_and_persists_failure_count(self):
+        file = w.STATE / 'processing/test.json'
+        w.atomic(file, {'username': 'alice', 'recipients': []})
+        jobs = queue.Queue()
+        jobs.put(file)
+        stop = Mock()
+        stop.is_set.return_value = False
+
+        def fail(_job):
+            if _job.get('failures', 0) >= 3:
+                stop.is_set.return_value = True
+                return
+            raise TimeoutError()
+
+        with patch.object(w, 'PROCESSING', jobs), patch.object(w, 'PROCESS_STOP', stop), \
+                patch.object(w, 'STOP', Mock(is_set=Mock(return_value=False))), \
+                patch.object(w, 'finalize', side_effect=fail), patch.object(w, 'emit') as emit:
+            w.processing()
+        self.assertEqual(emit.call_count, 1)
+        self.assertFalse(file.exists())
+
+    def run_live_monitor(self, outcomes):
+        recipients = {'allowedIds': ['100'], 'users': {'100': {
+            'tiktokTargets': {'alice': {'generation': 'test'}}}}}
+        api = Mock()
+        api.get_room_id_from_user.return_value = '123'
+        api.is_room_alive.side_effect = outcomes
+
+        class BaseRecorder:
+            def __init__(self, _config):
+                self.tiktok = api
+
+        class UserLiveError(Exception):
+            pass
+
+        class LiveNotFound(Exception):
+            pass
+
+        modules = {
+            'core.tiktok_recorder': SimpleNamespace(TikTokRecorder=BaseRecorder),
+            'utils.custom_exceptions': SimpleNamespace(UserLiveError=UserLiveError, LiveNotFound=LiveNotFound),
+            'utils.enums': SimpleNamespace(TikTokError=SimpleNamespace(USER_NOT_CURRENTLY_LIVE='offline')),
+        }
+        stop = Mock()
+        ticks = []
+        stop.is_set.side_effect = lambda: len(ticks) >= len(outcomes)
+        stop.wait.side_effect = lambda _seconds: ticks.append(1)
+        with patch.dict(sys.modules, modules), patch.object(w, 'STOP', stop), \
+                patch.object(w, 'settings', return_value=recipients), patch.object(w, 'emit') as emit:
+            w.record_account('alice', {})
+        return emit
+
+    def test_live_monitor_waits_three_failures_then_recovers_once(self):
+        emit = self.run_live_monitor([TimeoutError(), TimeoutError(), TimeoutError(), False])
+        self.assertEqual(emit.call_count, 2)
+        self.assertIn('失敗', emit.call_args_list[0].args[2])
+        self.assertIn('恢復', emit.call_args_list[1].args[2])
+
+    def test_live_monitor_two_failures_recover_silently(self):
+        emit = self.run_live_monitor([TimeoutError(), TimeoutError(), False, TimeoutError()])
+        self.assertEqual(emit.call_count, 0)
+
+    def test_live_monitor_captcha_is_immediate(self):
+        emit = self.run_live_monitor([RuntimeError('TIKTOK_CAPTCHA_REQUIRED')])
+        self.assertEqual(emit.call_count, 1)
 
 
 if __name__ == '__main__':

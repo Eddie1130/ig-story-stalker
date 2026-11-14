@@ -141,8 +141,10 @@ test('health and alert recovery remain isolated per target', t => {
   const f = fixture(t), outbox = path.join(f.dir, 'outbox');
   const issues = new Issues(path.join(f.dir, 'issues.json'), outbox, 'all');
   const alice = { target: '101', username: 'alice' }, bob = { target: '202', username: 'bob' };
-  issues.fail(targetIssueKey(alice, 'fetch'), 'FAILED', '@alice');
-  issues.fail(targetIssueKey(bob, 'fetch'), 'FAILED', '@bob');
+  for(let i=0;i<3;i++) {
+    issues.fail(targetIssueKey(alice, 'fetch'), 'FAILED', '@alice');
+    issues.fail(targetIssueKey(bob, 'fetch'), 'FAILED', '@bob');
+  }
   issues.resolve(targetIssueKey(bob, 'fetch'));
   assert.equal(issues.activeCount(), 1);
   const alerts = fs.readdirSync(outbox).map(name => read(path.join(outbox, name)).text);
@@ -221,7 +223,8 @@ test('migration rejects account folder collisions including numeric usernames an
 test('legacy supervisor issues migrate to the old account and resolve after restart', t => {
   const f = fixture(t), file = path.join(f.dir, 'issues.json'), outbox = path.join(f.dir, 'outbox');
   const issues = new Issues(file, outbox, '@alice');
-  issues.fail('fetch', 'FETCH_TIMEOUT'); issues.fail('nas-storage', 'NAS_ENOSPC'); issues.fail('worker-stall', 'STALLED');
+  for(let i=0;i<3;i++)issues.fail('fetch', 'FETCH_TIMEOUT');
+  issues.fail('nas-storage', 'NAS_ENOSPC'); issues.fail('worker-stall', 'STALLED');
   issues.migrateAccount('alice');
   const restarted = new Issues(file, outbox, 'all');
   restarted.resolve(targetIssueKey({ username: 'bob' }, 'fetch'));
@@ -365,4 +368,18 @@ test('registered account does not adopt a destination without migration history'
   fs.writeFileSync(path.join(f.state, 'archive-layout.json'), JSON.stringify({ version: 1, accounts: { 101: 'alice' }, legacyChecked: true, migration: null }));
   assert.throws(() => accountArchiveRoot(f.root, f.state, '101', 'alice'), /DESTINATION_EXISTS/);
   assert.equal(fs.readFileSync(path.join(f.root, 'instagram/alice/keep'), 'utf8'), 'unrelated');
+});
+
+test('first recoverable target runtime failure is waiting, while integrity failures remain immediate',async t=>{
+  const f=fixture(t),calls=[];
+  const rename=fs.renameSync;
+  t.mock.method(fs,'renameSync',(source,destination)=>{
+    if(destination===path.join(f.state,'watch-media-101.json'))throw Error('TARGET_RUNTIME_ERROR');
+    return rename(source,destination);
+  });
+  t.mock.method(globalThis,'fetch',async()=>({ok:true,json:async()=>({ok:true})}));
+  await main({env,args:['--once'],dir:f.state,resolve,fetcher:fakeFetch(calls),sleepImpl:async()=>{}});
+  const h=read(path.join(f.state,'health.json'));
+  assert.equal(h.targets[0].failures,1);assert.equal(h.targets[1].failures,0);
+  process.exitCode=0;
 });
