@@ -11,6 +11,8 @@ services:
     restart: unless-stopped
 
   tiktok-vpn:
+    ports:
+      - "${TIKTOK_LOGIN_BIND_ADDRESS:-127.0.0.1}:${TIKTOK_LOGIN_PORT:-6081}:6081"
     image: qmcgaw/gluetun:latest
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun:/dev/net/tun]
@@ -67,6 +69,56 @@ services:
       timeout: 5s
       retries: 3
 
+  tiktok-catalog:
+    shm_size: 512mb
+    build:
+      context: .
+      dockerfile: Dockerfile.tiktok-catalog
+      target: catalog
+    init: true
+    network_mode: service:tiktok-vpn
+    depends_on:
+      tiktok-vpn:
+        condition: service_started
+      ig-telegram:
+        condition: service_healthy
+    environment:
+      TIKTOK_CATALOG_BROWSER: ${TIKTOK_CATALOG_BROWSER:-1}
+      TIKTOK_COOKIE_FILE: /app/cookies.json
+      IG_TELEGRAM_CONTROL: ${IG_TELEGRAM_CONTROL:-1}
+    volumes:
+      - tiktok-catalog-profile:/data/catalog-profile
+      - ./data/tiktok/cookies.json:/app/cookies.json:ro
+      - ${IG_DATA_DIR:-./data}/control:/app/control:ro
+      - ${IG_DATA_DIR:-./data}/watch:/app/state
+      - ${IG_DOWNLOAD_DIR:-./downloads}:/downloads
+    restart: unless-stopped
+    stop_grace_period: 45s
+    healthcheck:
+      test: [CMD, python, -c, "import json,time; h=json.load(open('/app/state/tiktok/catalog/health.json')); assert time.time()*1000-h['at']<120000 and h.get('phase')!='stopped' and not h.get('manualRequired') and not any(s.get('failures') for t in h.get('targets',{}).values() for s in t.values())"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+
+  tiktok-login:
+    profiles: [tiktok-login]
+    build:
+      context: .
+      dockerfile: Dockerfile.tiktok-catalog
+      target: login
+    init: true
+    network_mode: service:tiktok-vpn
+    depends_on: [tiktok-vpn]
+    environment:
+      VNC_PASSWORD: ${VNC_PASSWORD:-}
+      TIKTOK_COOKIE_FILE: /app/cookies.json
+    volumes:
+      - tiktok-catalog-profile:/data/catalog-profile
+      - ./data/tiktok/cookies.json:/app/cookies.json:ro
+    shm_size: 512mb
+    restart: "no"
+
   ig-telegram:
     environment:
       TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
@@ -82,3 +134,4 @@ services:
 volumes:
   telegram-local-data:
   tiktok-browser-profile:
+  tiktok-catalog-profile:

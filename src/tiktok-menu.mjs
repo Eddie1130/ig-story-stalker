@@ -1,4 +1,4 @@
-import { tikTokName, tikTokKinds, tikTokSubscription } from './tiktok-settings.mjs';
+import { tikTokName, tikTokKinds, tikTokSubscription, tikTokLabels } from './tiktok-settings.mjs';
 const b = (text, callback_data) => ({ text, callback_data });
 const panel = (text, rows = []) => ({ text, reply_markup: { inline_keyboard: [...rows, [b('⬅️ TikTok', 'tt:menu'), b('主選單', 'menu')]] } });
 const subFor = (u, n) => Object.hasOwn(u.tiktokTargets || {}, n) ? u.tiktokTargets[n] : undefined;
@@ -6,8 +6,8 @@ function account(user, name) {
   const sub = subFor(user, name);
   if (!sub) return panel('帳號已移除。');
   const gen = sub.generation.slice(0, 8);
-  return panel(`TikTok @${name}\n關閉通知仍持續本機錄影。`, [
-    ...tikTokKinds.map(k => [b(`${k === 'start' ? '開播通知' : '完成後傳送影片'}：${sub.notifications[k].enabled ? '✅' : '🔕'}`, `tt:set:${name}:${k}:${sub.notifications[k].enabled ? 0 : 1}:${gen}`)]),
+  return panel(`TikTok @${name}\n關閉通知仍持續本機封存；讚好清單為選用功能。`, [
+    ...tikTokKinds.map(k => [b(`${tikTokLabels[k]}：${sub.notifications[k].enabled ? '✅' : '🔕'}`, `tt:set:${name}:${k}:${sub.notifications[k].enabled ? 0 : 1}:${gen}`)]),
     [b('移除訂閱', `tt:remove:${name}:${gen}`)],
   ]);
 }
@@ -18,7 +18,7 @@ export function tikTokCallback(user, data, now) {
     delete user.waiting;
     const names = Object.keys(user.tiktokTargets).sort();
     const page = action === 'list' && /^\d{1,5}$/.test(name || '') ? Math.min(Number(name), Math.max(0, Math.ceil(names.length / 8) - 1)) : 0;
-    return panel('🎬 TikTok LIVE 訂閱', [...names.slice(page * 8, page * 8 + 8).map(n => [b('@' + n, 'tt:account:' + n)]),
+    return panel('🎬 TikTok 帳號訂閱', [...names.slice(page * 8, page * 8 + 8).map(n => [b('@' + n, 'tt:account:' + n)]),
       ...(page ? [[b('上一頁', `tt:list:${page - 1}`)]] : []), ...(names.length > (page + 1) * 8 ? [[b('下一頁', `tt:list:${page + 1}`)]] : []), [b('新增帳號', 'tt:add')]]);
   }
   if (action === 'add') { user.waiting = 'tt:add'; return panel('請輸入 TikTok 帳號，例如 @alice。輸入 /cancel 取消。'); }

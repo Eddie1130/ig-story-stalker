@@ -12,7 +12,7 @@ export function mainMenu(user) {
   return panel('Instagram／X／TikTok 監看設定\n通知開關只影響 Telegram，本機仍會下載。', [
     [button('📷 Instagram', 'ig:menu'), button('𝕏 X / Twitter', 'x:menu')],
     [button('👥 監看帳號', 'list:0'), button('➕ 新增帳號', 'add')],
-    [button('🎬 TikTok LIVE', 'tt:menu')],
+    [button('🎬 TikTok', 'tt:menu')],
     [button('🔔 媒體通知', 'list:0')],
     [button(`📋 每日摘要：${user.daily ? '開啟' : '關閉'}`, `daily:${user.daily ? 0 : 1}`)],
     [button('🔗 連結下載', 'download')],

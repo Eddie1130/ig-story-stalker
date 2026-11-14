@@ -1,0 +1,15 @@
+FROM python:3.12-slim-bookworm AS catalog
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg xvfb \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir gallery-dl==1.32.19 playwright==1.58.0
+RUN playwright install --with-deps chromium
+WORKDIR /app
+COPY tiktok/catalog_provider.py tiktok/catalog_worker.py tiktok/worker.py tiktok/catalog_browser.py tiktok/catalog_media.py tiktok/catalog_regular_browser.py tiktok/catalog_layout.py ./
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+CMD ["python", "/app/catalog_worker.py"]
+
+FROM catalog AS login
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox \
+    && rm -rf /var/lib/apt/lists/*
+COPY tiktok/catalog_login.py tiktok/start-catalog-login.sh ./
+CMD ["sh", "/app/start-catalog-login.sh"]

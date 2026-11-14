@@ -1,3 +1,5 @@
+import { tikTokContentKinds } from './tiktok-settings.mjs';
+import { tikTokContentPlan, contentBody } from './tiktok-content-files.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -20,13 +22,15 @@ export class TikTokDelivery extends XDelivery {
     const dir = path.join(this.stateDir, 'tiktok/events');
     fs.mkdirSync(dir, { recursive: true });
     let ok = true;
-    for (const name of fs.readdirSync(dir).filter(n => /^[a-f0-9]{64}\.json$/.test(n)).sort().slice(0, 100)) {
+    let processed = 0;
+    for (const name of fs.readdirSync(dir).filter(n => /^[a-f0-9]{64}\.json$/.test(n)).sort()) {
       if (stopping()) break;
       let event;
       try {
       event = load(path.join(dir, name), null);
-      if (!event || !tikTokName(event.username) || !['start','video','notice'].includes(event.kind) || !Number.isFinite(event.at) || !Array.isArray(event.recipients) || event.recipients.some(r => !/^[1-9]\d{0,19}$/.test(r?.userId) || typeof r.generation !== 'string') || typeof event.text !== 'string' || event.text.length > 4000 || !Array.isArray(event.files) || event.files.some(f => typeof f !== 'string')) throw Error('TIKTOK_EVENT_INVALID');
-      if (lane === 'video' && event.kind !== 'video' || lane === 'notice' && event.kind === 'video') continue;
+      if (!event || !tikTokName(event.username) || !['start','video','notice', ...tikTokContentKinds].includes(event.kind) || !Number.isFinite(event.at) || !Array.isArray(event.recipients) || event.recipients.some(r => !/^[1-9]\d{0,19}$/.test(r?.userId) || typeof r.generation !== 'string') || typeof event.text !== 'string' || event.text.length > 100000 || !Array.isArray(event.files) || event.files.some(f => typeof f !== 'string')) throw Error('TIKTOK_EVENT_INVALID');
+      if (lane === 'video' && event.kind !== 'video' || lane === 'notice' && !['notice', 'start'].includes(event.kind) || lane === 'content' && (!tikTokContentKinds.includes(event.kind) || event.kind === 'story') || lane === 'story' && event.kind !== 'story') continue;
+      if (++processed > 100) break;
       for (const recipient of event.recipients) {
         const key = createHash('sha256').update(`${name}:${recipient.userId}:${recipient.generation}`).digest('hex');
         const entry = this.state.receipts[key] ||= { nextText: 0, nextGroup: 0, failures: 0 };
@@ -38,10 +42,12 @@ export class TikTokDelivery extends XDelivery {
           else ok = false;
           continue;
         }
-        const items = [null, ...event.files];
+        const content = tikTokContentKinds.includes(event.kind);
+        const items = content ? tikTokContentPlan(event, this.root) : [null, ...event.files];
         for (let i = entry.nextGroup; i < items.length && !stopping(); i++) {
           let body = { chat_id: recipient.userId, text: event.text }, method = 'sendMessage';
-          if (items[i]) {
+          if (content) { method = items[i].method; body = { chat_id: recipient.userId, ...contentBody(this.root, event, items[i]) }; }
+          else if (items[i]) {
             const relative = items[i];
             if (!relative.startsWith(`tiktok/${event.username}/live/`) || relative.split(/[\\/]/).some(p => !p || p === '.' || p === '..') || !relative.endsWith('.mp4')) throw Error('TIKTOK_FILE_INVALID');
             const root = fs.realpathSync(this.root), filename = fs.realpathSync(path.join(root, relative));
@@ -49,7 +55,7 @@ export class TikTokDelivery extends XDelivery {
             method = 'sendVideo';
             body = { chat_id: recipient.userId, video: 'file://' + filename, caption: `TikTok @${event.username}（${i}/${event.files.length}）`, supports_streaming: true };
           }
-          const outcome = await this.send(client, entry, method, body, [], 1, () => this.eligible(event, recipient));
+          const outcome = await this.send(client, entry, method, body, [], method === 'sendMediaGroup' ? body.media.length : 1, () => this.eligible(event, recipient));
           if (outcome !== 'sent') { ok = false; break; }
           entry.nextGroup = i + 1; this.persist();
         }

@@ -74,6 +74,12 @@ export function describeUser(settings, id, stateDir, watchdogDir = null) {
     lines.push("", "🎬 TikTok LIVE");
     for (const name of ttNames) lines.push(`@${name}：${h?.targets?.[name]?.phase || "等待首次檢查"}`);
     if (!h || Date.now() - h.at > 120000) lines.push("TikTok worker 心跳過期或尚未啟動。");
+    const catalog = read(path.join(stateDir, 'tiktok/catalog/health.json'), null);
+    if (!catalog || Date.now() - catalog.at > 120000 || catalog.phase === 'stopped') lines.push('TikTok 內容監控尚未啟動或心跳過期。');
+    else {
+      for (const name of ttNames) for (const [kind, state] of Object.entries(catalog.targets?.[name] || {})) lines.push(`@${name} ${kind}：${state.phase}${state.reason ? '（' + state.reason + '）' : ''}`);
+      lines.push(`內容待下載：${catalog.pending || 0}`);
+    }
   }
   const issues = { ...read(path.join(stateDir, 'monitor/issues.json'), {}), ...(watchdogDir ? read(path.join(watchdogDir, 'issues.json'), {}) : {}) };
   const targetIds = new Set(targets.filter(t => t && names.includes(t.username)).map(t => t.target));
@@ -109,16 +115,16 @@ export async function run({ env = process.env, args = process.argv } = {}) {
   const manual = new ManualDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
   const xDelivery = env.X_ENABLED === '0' ? null : new XDelivery({ root: env.IG_ARCHIVE_DIR || '/downloads', dir, stateDir, settings: () => settings, log });
   const ttDelivery = new TikTokDelivery({ root: env.IG_ARCHIVE_DIR || "/downloads", dir, stateDir, settings: () => settings, log });
-  const ttOk = { video: true, notice: true };
+  const ttOk = { video: true, notice: true, content: true, story: true };
   const persistSettings = () => atomic(settingsFile(env), settings);
   const describe = id => describeUser(settings, id, stateDir, env.IG_WATCHDOG_DIR || '/app/watchdog-state');
-  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk && ttOk.video && ttOk.notice, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
+  const health = () => atomic(path.join(dir, 'health.json'), { at: Date.now(), telegramOk: telegramOk && xTelegramOk && ttOk.video && ttOk.notice && ttOk.content && ttOk.story, pollOk, lastPollAt, pending: Object.keys(delivery.state.pending).length });
   const heartbeat = setInterval(health, 15000);
   try {
     // Do not silently delete another deployment's webhook or pending updates.
     const webhook = await client.call('getWebhookInfo', {}, { polling: true });
     if (webhook?.url) throw Error('TELEGRAM_WEBHOOK_CONFIGURED');
-    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'ttadd', description: '新增 TikTok LIVE 帳號，例如 /ttadd alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
+    await client.call('setMyCommands', { commands: [{ command: 'menu', description: '開啟 Instagram／X 設定選單' }, { command: 'status', description: '查看我的監看狀態' }, { command: 'add', description: '新增 IG 帳號，例如 /add alice' }, { command: 'ttadd', description: '新增 TikTok 帳號，例如 /ttadd alice' }, { command: 'xadd', description: '新增 X 帳號，例如 /xadd alice' }, { command: 'xhistory', description: '歷史回補，例如 /xhistory alice' }, { command: 'cancel', description: '取消目前操作' }, { command: 'download', description: '貼上 Instagram 或 X 連結下載原檔' }] });
     await client.call('setChatMenuButton', { menu_button: { type: 'commands' } });
     health(); log('TELEGRAM_CONTROL_STARTED');
     async function poll() {
@@ -173,8 +179,8 @@ export async function run({ env = process.env, args = process.argv } = {}) {
         if (!args.includes("--once")) await wait(1000);
       } while (!stopping && !args.includes("--once"));
     }
-    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch(), tikTokDispatch('notice'), tikTokDispatch('video')]);
-    if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk && ttOk.video && ttOk.notice ? 0 : 1;
+    await Promise.all([poll(), dispatch(), manualDispatch(), xDispatch(), tikTokDispatch('notice'), tikTokDispatch('video'), tikTokDispatch('content'), tikTokDispatch('story')]);
+    if (args.includes('--once')) process.exitCode = pollOk && telegramOk && xTelegramOk && ttOk.video && ttOk.notice && ttOk.content && ttOk.story ? 0 : 1;
   } finally {
     stopping = true; signal.abort(); clearInterval(heartbeat);
     for (const name of ['SIGTERM', 'SIGINT']) process.off(name, stop);
